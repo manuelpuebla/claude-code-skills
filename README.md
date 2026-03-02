@@ -1,6 +1,6 @@
 # claude-code-skills
 
-Coleccion de 13 custom skills para [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (la CLI oficial de Anthropic). Cada skill es un directorio independiente que puedes copiar a tu `~/.claude/skills/` para extender las capacidades de Claude.
+Coleccion de 13 custom skills y 11 hooks para [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (la CLI oficial de Anthropic). Cada skill es un directorio independiente que puedes copiar a tu `~/.claude/skills/`, y los hooks se copian a `~/.claude/hooks/`.
 
 ## Que es esto
 
@@ -27,6 +27,15 @@ cp -R claude-code-skills/plan-project ~/.claude/skills/
 ```
 
 Despues de copiar, reinicia Claude Code para que detecte las nuevas skills.
+
+### Instalar hooks
+
+```bash
+cp -R claude-code-skills/hooks/*.sh ~/.claude/hooks/
+chmod +x ~/.claude/hooks/*.sh
+```
+
+Luego registra los hooks en tu `~/.claude/settings.json`. Hay un ejemplo completo en `hooks/hooks-config.example.json` — copia la seccion `"hooks"` a tu settings. Si ya tienes hooks definidos, mergea las entradas manualmente.
 
 ### Setup especial: ask-dojo
 
@@ -68,6 +77,56 @@ Esto descarga el dataset LeanDojo (~150 MB) y el modelo `tacgen-byt5-small` (~1.
 | **autopsy** | `/autopsy` | Post-mortem de proyecto Lean 4: cruza README claims x DAG x cobertura de codigo. Sugiere propiedades SlimCheck |
 | **tidy-project** | `/tidy-project` | Reformatea ARCHITECTURE.md y BENCHMARKS.md al formato estandar. Extrae lecciones y genera dag.json |
 | **telegram** | `/telegram` | Modo away: activa/desactiva notificaciones Telegram para trabajo autonomo sin supervision |
+
+## Hooks
+
+Los hooks son shell scripts que Claude Code ejecuta automaticamente en respuesta a eventos (antes/despues de usar una herramienta, al detenerse, al pedir permisos). Se copian a `~/.claude/hooks/` y se registran en `~/.claude/settings.json`.
+
+### PreToolUse (se ejecutan ANTES de que Claude use una herramienta)
+
+| Hook | Trigger | Que hace |
+|------|---------|----------|
+| **warn-large-read.sh** | `Read` | Advierte si se intenta leer un archivo source >200 lineas sin offset. Sugiere usar scout.py primero |
+| **suggest-scout-on-grep.sh** | `Grep` | Sugiere usar scout.py para busquedas estructurales en directorios source |
+| **edit-guards.sh** | `Edit` | Verifica branch correcto, fan-out de archivos Lean, dirty tree, y que no se edite sin close_block |
+
+### PostToolUse (se ejecutan DESPUES de que Claude usa una herramienta)
+
+| Hook | Trigger | Que hace |
+|------|---------|----------|
+| **track-compilation.sh** | `Bash` | Rastrea fallos de compilacion Lean. Si falla >=3 veces, sugiere usar ask-dojo y ask-lean |
+| **compile-after-edits.sh** | `Edit` | Dispara compilacion automatica despues de editar archivos .lean |
+
+### Eventos globales
+
+| Hook | Trigger | Que hace |
+|------|---------|----------|
+| **telegram-away.sh** | `Stop`, `PermissionRequest` | Si el modo away esta activo, notifica via Telegram cuando Claude se detiene o necesita permisos |
+| **telegram-notify.sh** | *(invocado por otros hooks)* | Envia notificaciones a Telegram. Lee bot_token de `~/.config/claude-telegram/config.json` |
+| **telegram-permission.sh** | *(invocado por telegram-away)* | Reenvia solicitudes de permisos a Telegram para aprobacion remota |
+
+### Workflow de proyecto
+
+| Hook | Uso | Que hace |
+|------|-----|----------|
+| **branch-per-block.sh** | Manual / CI | Crea una branch git por cada bloque de trabajo del DAG |
+| **checkpoint-critical-edit.sh** | Manual | Hace commit checkpoint antes de ediciones criticas en archivos fundamentales |
+| **guard-block-close.sh** | Manual | Verifica que se cumplan las precondiciones antes de cerrar un bloque (QA, benchmarks, lessons) |
+
+### Configuracion
+
+Los hooks se registran en `~/.claude/settings.json` bajo la clave `"hooks"`. Hay un ejemplo completo en [`hooks/hooks-config.example.json`](hooks/hooks-config.example.json).
+
+Los hooks de Telegram requieren configuracion adicional en `~/.config/claude-telegram/config.json`:
+
+```json
+{
+  "bot_token": "tu-bot-token-de-telegram",
+  "chat_id": "tu-chat-id"
+}
+```
+
+Para obtener estos valores: crea un bot con [@BotFather](https://t.me/BotFather) y obtiene tu chat_id enviando un mensaje al bot y consultando `https://api.telegram.org/bot<TOKEN>/getUpdates`.
 
 ## Variables de Entorno
 
@@ -192,6 +251,19 @@ claude-code-skills/
 ├── README.md
 ├── LICENSE
 ├── .gitignore
+├── hooks/
+│   ├── hooks-config.example.json  # Ejemplo de configuracion para settings.json
+│   ├── warn-large-read.sh
+│   ├── suggest-scout-on-grep.sh
+│   ├── edit-guards.sh
+│   ├── track-compilation.sh
+│   ├── compile-after-edits.sh
+│   ├── telegram-away.sh
+│   ├── telegram-notify.sh
+│   ├── telegram-permission.sh
+│   ├── branch-per-block.sh
+│   ├── checkpoint-critical-edit.sh
+│   └── guard-block-close.sh
 ├── ask-dojo/
 │   ├── SKILL.md
 │   └── scripts/
