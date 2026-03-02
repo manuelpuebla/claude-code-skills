@@ -1,0 +1,69 @@
+# === Modelos ML y datos pesados ===
+*.safetensors
+*.arrow
+*.bin
+*.onnx
+*.pt
+*.pth
+*.pkl
+*.h5
+*.pb
+*.tflite
+*.gguf
+*.ggml
+*.npy
+*.npz
+
+# === PDFs y documentos ===
+*.pdf
+*.doc
+*.docx
+
+# === Secretos y credenciales ===
+.env
+.env.*
+*.key
+*.pem
+*.secret
+credentials.json
+token.json
+
+# === ask-dojo datos (se descargan con setup.py) ===
+ask-dojo/data/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+venv/
+.venv/
+.mypy_cache/
+.pytest_cache/
+
+# === macOS ===
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# === Editores ===
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# === Lean 4 ===
+.lake/
+lake-packages/
+build/
+
+# === Temporales ===
+*.log
+*.bak
+*.tmp
