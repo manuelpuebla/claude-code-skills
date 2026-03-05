@@ -449,6 +449,8 @@ def check_prerequisites(project: Path) -> dict:
         "existing_test_files": {},
         "bridge_exists": False,
         "results_json_exists": False,
+        "mathlib_available": False,
+        "test_overlay_exists": False,
         "errors": [],
         "warnings": [],
         "exit_code": 0,
@@ -549,6 +551,24 @@ def check_prerequisites(project: Path) -> dict:
 
     # Check results.json
     result["results_json_exists"] = (project / "Tests" / "results.json").exists()
+
+    # Detect Mathlib availability
+    for name in ("lakefile.toml", "lakefile.lean"):
+        lf = project / name
+        if lf.exists():
+            content = lf.read_text(encoding="utf-8")
+            if "mathlib" in content.lower():
+                result["mathlib_available"] = True
+                break
+    # Check for test overlay
+    overlay_lf = project / "Tests" / "lakefile.toml"
+    if overlay_lf.exists():
+        result["test_overlay_exists"] = True
+        if not result["mathlib_available"]:
+            result["mathlib_available"] = True  # available via overlay
+            result["warnings"].append(
+                "Mathlib available via Tests/ overlay (not in main project)"
+            )
 
     # Determine exit code (if not already fatal)
     if result["exit_code"] == 3:

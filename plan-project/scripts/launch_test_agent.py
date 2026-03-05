@@ -38,14 +38,25 @@ You are a Testing Engineer for a Lean 4 project. Write and execute tests.
 - Compile: Bash: lake env lean Tests/Properties/{{Node}}.lean (from {project_path})
 - Run tests: Bash: python3 {run_tests_py} --project {project_path} --node {{node_id}} --json --save-results {results_path}
 
+## Bridge Requirements (MANDATORY if "Formal Bridge Requirements" section exists below)
+If the Test Specifications below contain a "Formal Bridge Requirements" section, you MUST:
+1. Create `Tests/Bridge.lean` as the FIRST test file
+2. Import the project library
+3. Define the concrete test domain type (e.g., ArithOp) OR import it from Tests/Integration/
+4. Add #check statements for ALL formal theorems listed in Bridge Requirements
+5. Add hypothesis witness proofs where feasible (theorem bridge_xxx : HypType := ...)
+6. Compile: lake env lean Tests/Bridge.lean (from {project_path})
+Bridge.lean MUST compile cleanly before writing other test files.
+
 ## Test Conventions
-- Properties: import Mathlib.Testing.SlimCheck, example/theorem with slim_check
+{mathlib_property_instructions}
 - Priority comments: -- P0, INVARIANT: description
 - NOT_YET_RUNNABLE: -- NOT_YET_RUNNABLE (if SampleableExt missing)
 - Integration: #eval with IO.println "[PASS] name" or "[FAIL] name"
 - main : IO UInt32 returning 0 if all pass
 
 ## Workflow
+0. If "Formal Bridge Requirements" section exists: Write and compile Tests/Bridge.lean FIRST
 For each node:
 1. Read source files to understand API
 2. Write Tests/Properties/{{Node}}.lean
@@ -58,6 +69,7 @@ For each node:
 Return exactly:
 ---TEST-RESULTS---
 OVERALL: PASS | FAIL
+BRIDGE: PASS|FAIL|SKIPPED - {{N}} #check statements, {{M}} witnesses
 RESULTS_FILE: {results_path}
 {node_result_placeholders}
 [BLOCKING: test_name: reason (if any failures)]
@@ -123,6 +135,29 @@ def main():
     outsource_content = outsource_path.read_text(encoding="utf-8")
     results_path = project / "Tests" / "results.json"
 
+    # Detect Mathlib availability for property test instructions
+    has_mathlib = False
+    for name in ("lakefile.toml", "lakefile.lean"):
+        lf = project / name
+        if lf.exists() and "mathlib" in lf.read_text(encoding="utf-8").lower():
+            has_mathlib = True
+            break
+    overlay_lf = project / "Tests" / "lakefile.toml"
+    if overlay_lf.exists() and "mathlib" in overlay_lf.read_text(encoding="utf-8").lower():
+        has_mathlib = True
+
+    if has_mathlib:
+        mathlib_prop = (
+            "- Properties: import Mathlib.Testing.SlimCheck, example/theorem with slim_check"
+        )
+    else:
+        mathlib_prop = (
+            "- Properties: This project does NOT have Mathlib. Write property tests as\n"
+            "  exhaustive #eval checks (test multiple concrete inputs, IO.println [PASS]/[FAIL]).\n"
+            "  Use the same structure as Integration tests but in Tests/Properties/{Node}.lean.\n"
+            "  Mark each with priority comments. Do NOT import Mathlib."
+        )
+
     prompt = PROMPT_TEMPLATE.format(
         project_path=project,
         node_list=", ".join(nodes.keys()),
@@ -131,6 +166,7 @@ def main():
         results_path=results_path,
         node_result_placeholders=build_node_result_placeholders(nodes),
         outsource_md_content=outsource_content,
+        mathlib_property_instructions=mathlib_prop,
     )
 
     if args.json:

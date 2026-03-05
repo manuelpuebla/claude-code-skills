@@ -44,37 +44,201 @@ PRIORITY_PATTERN = re.compile(
 TEST_NAME_PATTERN = re.compile(r'\("?(\w+)"?\s*,')
 
 
+# ─── Mathlib Detection ──────────────────────────────────────────────────────
+
+def detect_mathlib(project: Path) -> bool:
+    """Check if the project already has Mathlib as a dependency."""
+    for name in ("lakefile.toml", "lakefile.lean"):
+        lf = project / name
+        if lf.exists():
+            content = lf.read_text(encoding="utf-8")
+            if "mathlib" in content.lower():
+                return True
+    return False
+
+
+def setup_test_overlay(project: Path) -> bool:
+    """Create a Tests/ sub-project with its own lakefile that imports Mathlib.
+
+    Returns True if overlay was created/exists, False if unnecessary or failed.
+    The overlay allows Tests/Properties/*.lean to import Mathlib.Testing.SlimCheck
+    without adding Mathlib to the main project.
+    """
+    if detect_mathlib(project):
+        return False  # already has Mathlib, no overlay needed
+
+    tests_dir = project / TESTS_DIR
+    tests_dir.mkdir(exist_ok=True)
+    overlay_lakefile = tests_dir / "lakefile.toml"
+
+    if overlay_lakefile.exists():
+        return True  # already set up
+
+    # Read project name and lean-toolchain
+    project_name = project.name
+    for name in ("lakefile.toml", "lakefile.lean"):
+        lf = project / name
+        if lf.exists():
+            content = lf.read_text(encoding="utf-8")
+            import re as _re
+            m = _re.search(r'name\s*=\s*"([^"]+)"', content)
+            if m:
+                project_name = m.group(1)
+            break
+
+    toolchain = "leanprover/lean4:v4.16.0"
+    tc_file = project / "lean-toolchain"
+    if tc_file.exists():
+        toolchain = tc_file.read_text(encoding="utf-8").strip()
+
+    # Write overlay lakefile
+    overlay_content = f"""# Auto-generated test overlay — imports Mathlib for SlimCheck property tests.
+# This does NOT modify the main project's dependencies.
+[package]
+name = "{project_name}-tests"
+
+[[require]]
+name = "{project_name}"
+path = ".."
+
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"
+
+[[lean_lib]]
+name = "Properties"
+globs = ["Properties"]
+"""
+    overlay_lakefile.write_text(overlay_content, encoding="utf-8")
+
+    # Write matching lean-toolchain
+    (tests_dir / "lean-toolchain").write_text(toolchain + "\n", encoding="utf-8")
+
+    return True
+
+
+def resolve_node_name(project: Path, node_id: str) -> str:
+    """Resolve a bare node ID (e.g., 'N1') to its DAG name (e.g., 'NatOpt').
+
+    For virtual-phase DAGs (declaration format), the node name is the file stem.
+    For planning-format DAGs, node names come from the phase definitions.
+    Returns the original node_id if resolution fails.
+    """
+    dag_path = project / "dag.json"
+    if not dag_path.exists():
+        return node_id
+    try:
+        dag = json.loads(dag_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return node_id
+
+    # Check planning-format phases first
+    phases = dag.get("phases", [])
+    if phases:
+        for phase in phases:
+            for node in phase.get("nodes", []):
+                if node.get("id") == node_id and node.get("name"):
+                    return node["name"]
+        return node_id
+
+    # Declaration format — build virtual phase mapping
+    if "declarations" not in dag:
+        return node_id
+
+    file_groups: dict[str, list] = {}
+    decl_by_name: dict[str, dict] = {}
+    for d in dag["declarations"]:
+        decl_by_name[d["name"]] = d
+        fname = Path(d.get("file", "")).stem if d.get("file") else "unknown"
+        file_groups.setdefault(fname, []).append(d)
+
+    graph_edges = dag.get("graph_edges", {})
+    file_deps: dict[str, set] = {f: set() for f in file_groups}
+    for d in dag["declarations"]:
+        src = Path(d.get("file", "")).stem if d.get("file") else "unknown"
+        for dep_name in graph_edges.get(d["name"], []):
+            dep = decl_by_name.get(dep_name)
+            if dep:
+                dst = Path(dep.get("file", "")).stem if dep.get("file") else "unknown"
+                if dst != src:
+                    file_deps[src].add(dst)
+
+    # Topological sort (same as _build_virtual_phases in test_project.py)
+    in_degree = {f: 0 for f in file_groups}
+    reverse_deps: dict[str, set] = {f: set() for f in file_groups}
+    for f, deps in file_deps.items():
+        for dep in deps:
+            if dep in reverse_deps:
+                reverse_deps[dep].add(f)
+                in_degree[f] += 1
+    queue = sorted([f for f, deg in in_degree.items() if deg == 0])
+    sorted_files: list[str] = []
+    while queue:
+        f = queue.pop(0)
+        sorted_files.append(f)
+        for dependent in sorted(reverse_deps.get(f, [])):
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                queue.append(dependent)
+    for f in file_groups:
+        if f not in sorted_files:
+            sorted_files.append(f)
+
+    # Match node ID to file stem
+    # node_id format: "N{idx}" where idx is 1-based
+    m = re.match(r"^N(\d+)$", node_id)
+    if m:
+        idx = int(m.group(1))
+        if 1 <= idx <= len(sorted_files):
+            return sorted_files[idx - 1]
+
+    return node_id
+
+
 # ─── File Discovery ──────────────────────────────────────────────────────────
+
+PROPERTY_TESTS_DIR = "PropertyTests"
 
 def find_test_files(project: Path, node_name: str) -> dict:
     """Find test files for a node.
 
     Convention: Tests/Properties/{NodeClean}.lean, Tests/Integration/{NodeClean}.lean
     where NodeClean is the node name without the ID prefix (e.g., N2.1 → UnionFind).
+
+    Also searches PropertyTests/Properties/ for Plausible-based property tests
+    (overlay project that imports Mathlib without contaminating the main project).
     """
     tests_dir = project / TESTS_DIR
     result = {"properties": None, "integration": None}
 
-    if not tests_dir.exists():
-        return result
-
     # Try exact match first, then fuzzy
     node_clean = _clean_node_name(node_name)
 
-    props_dir = tests_dir / PROPERTIES_DIR
-    integ_dir = tests_dir / INTEGRATION_DIR
+    # Search for properties in both Tests/Properties/ and PropertyTests/Properties/
+    prop_dirs = []
+    if tests_dir.exists():
+        prop_dirs.append(tests_dir / PROPERTIES_DIR)
+    overlay_props = project / PROPERTY_TESTS_DIR / PROPERTIES_DIR
+    if overlay_props.exists():
+        prop_dirs.append(overlay_props)
 
-    if props_dir.exists():
-        for f in props_dir.glob("*.lean"):
-            if _matches_node(f.stem, node_clean, node_name):
-                result["properties"] = f
+    for props_dir in prop_dirs:
+        if props_dir.exists():
+            for f in props_dir.glob("*.lean"):
+                if _matches_node(f.stem, node_clean, node_name):
+                    result["properties"] = f
+                    break
+            if result["properties"]:
                 break
 
-    if integ_dir.exists():
-        for f in integ_dir.glob("*.lean"):
-            if _matches_node(f.stem, node_clean, node_name):
-                result["integration"] = f
-                break
+    # Integration: only in Tests/Integration/
+    if tests_dir.exists():
+        integ_dir = tests_dir / INTEGRATION_DIR
+        if integ_dir.exists():
+            for f in integ_dir.glob("*.lean"):
+                if _matches_node(f.stem, node_clean, node_name):
+                    result["integration"] = f
+                    break
 
     return result
 
@@ -109,15 +273,17 @@ def _matches_node(filename: str, node_clean: str, node_id: str) -> bool:
 # ─── Test Execution ─────────────────────────────────────────────────────────
 
 def run_lean_file(project: Path, filepath: Path, timeout: int = 300,
-                  run_main: bool = False) -> dict:
+                  run_main: bool = False, cwd: Path | None = None) -> dict:
     """Run a Lean file via lake env lean and capture output.
 
     If run_main=True, uses --run to execute the main function (for integration tests).
+    cwd overrides the working directory (default: project root).
     """
     cmd = ["lake", "env", "lean"]
     if run_main:
         cmd.append("--run")
     cmd.append(str(filepath))
+    work_dir = str(cwd) if cwd else str(project)
 
     try:
         result = subprocess.run(
@@ -125,7 +291,7 @@ def run_lean_file(project: Path, filepath: Path, timeout: int = 300,
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=str(project),
+            cwd=work_dir,
         )
         return {
             "exit_code": result.returncode,
@@ -149,16 +315,25 @@ def run_lean_file(project: Path, filepath: Path, timeout: int = 300,
         }
 
 
+def _detect_eval_mode(source: str) -> bool:
+    """Detect if a Properties file uses #eval-based tests (no-Mathlib mode)
+    instead of slim_check theorems."""
+    return "def main" in source and ("[PASS]" in source or "[FAIL]" in source)
+
+
 def parse_properties_result(
     filepath: Path, run_result: dict
 ) -> dict:
     """Parse results from a Properties test file.
 
-    Properties use slim_check tactic:
-    - No output for a property = PASS (slim_check passes silently)
-    - "Found a counter-example" = FAIL
-    - "error:" in stderr = ERROR (compilation)
-    - NOT_YET_RUNNABLE marker in source = skip
+    Two modes:
+    1. SlimCheck mode (Mathlib): example/theorem with slim_check tactic
+       - No output = PASS (slim_check passes silently)
+       - "Found a counter-example" = FAIL
+    2. Eval mode (no Mathlib): #eval with [PASS]/[FAIL] output
+       - Same format as Integration tests
+
+    Common: "error:" in stderr = ERROR, NOT_YET_RUNNABLE marker = skip
     """
     source = filepath.read_text(encoding="utf-8") if filepath.exists() else ""
     source_lines = source.splitlines()
@@ -166,6 +341,11 @@ def parse_properties_result(
     stdout = run_result.get("stdout", "")
     output = stderr + "\n" + stdout
 
+    # Detect eval-based property tests (no-Mathlib mode)
+    if _detect_eval_mode(source):
+        return _parse_eval_properties(filepath, run_result, source_lines)
+
+    # ── SlimCheck mode ──
     # Extract properties from source
     properties = []
     current_priority = "P1"
@@ -212,26 +392,24 @@ def parse_properties_result(
 
     # If compilation error, mark all non-skipped as ERROR
     has_error = "error:" in output.lower() and run_result.get("exit_code", 0) != 0
-    has_counter = "counter-example" in output.lower() or "counterexample" in output.lower()
+    # Plausible/SlimCheck outputs:
+    #   PASS: "Unable to find a counter-example"
+    #   FAIL: "Found a counter-example!" (without "Unable to find")
+    found_counter = "found a counter-example" in output.lower()
+    only_unable = "unable to find a counter-example" in output.lower()
+    has_real_counter = found_counter and not only_unable
 
     if has_error:
         for p in properties:
             if p["status"] == "PENDING":
                 p["status"] = "ERROR"
-    elif has_counter:
-        # Try to match counter-examples to specific properties
-        # For now, mark all as needing investigation, then refine
-        counter_lines = [
-            l for l in output.splitlines()
-            if "counter" in l.lower() or "example" in l.lower()
-        ]
-        # Simple heuristic: if any counter-example, check which property failed
+    elif has_real_counter:
+        # Per-property granularity: map counter-example lines to property lines
+        # For now, mark all as FAIL (conservative — most files test one concept)
         for p in properties:
             if p["status"] == "PENDING":
-                # Check if this specific property's name appears near a counter-example
-                p["status"] = "FAIL" if counter_lines else "PASS"
+                p["status"] = "FAIL"
     else:
-        # No errors, no counter-examples = all pass
         for p in properties:
             if p["status"] == "PENDING":
                 p["status"] = "PASS"
@@ -251,6 +429,69 @@ def parse_properties_result(
         "not_runnable": not_runnable,
         "errors": errors,
         "details": properties,
+    }
+
+
+def _parse_eval_properties(
+    filepath: Path, run_result: dict, source_lines: list[str]
+) -> dict:
+    """Parse #eval-based property tests (no-Mathlib mode).
+
+    Same [PASS]/[FAIL] format as integration tests, but we also extract
+    priority/type comments from source for richer reporting.
+    """
+    stdout = run_result.get("stdout", "")
+    stderr = run_result.get("stderr", "")
+    output = stdout + "\n" + stderr
+    exit_code = run_result.get("exit_code", -1)
+
+    # Build priority map from source comments
+    priority_map: dict[str, tuple[str, str]] = {}  # name -> (priority, type)
+    current_priority = "P1"
+    current_type = "UNKNOWN"
+    for line in source_lines:
+        stripped = line.strip()
+        m = PRIORITY_PATTERN.match(stripped)
+        if m:
+            current_priority = m.group(1)
+            if m.group(2):
+                current_type = m.group(2)
+            continue
+        # Match def test_xxx lines to associate priority
+        dm = re.match(r"^def\s+(test_\w+)", stripped)
+        if dm:
+            priority_map[dm.group(1)] = (current_priority, current_type)
+
+    details = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if "[PASS]" in stripped:
+            name_match = re.search(r"\[PASS\]\s+(.*)", stripped)
+            name = name_match.group(1).strip() if name_match else "unknown"
+            p, t = priority_map.get(name, ("P1", "UNKNOWN"))
+            details.append({"name": name, "status": "PASS", "priority": p, "type": t})
+        elif "[FAIL]" in stripped:
+            name_match = re.search(r"\[FAIL\]\s+(.*)", stripped)
+            name = name_match.group(1).strip() if name_match else "unknown"
+            p, t = priority_map.get(name, ("P1", "UNKNOWN"))
+            details.append({"name": name, "status": "FAIL", "priority": p, "type": t})
+
+    if not details and ("error:" in stderr.lower() or exit_code != 0):
+        details.append({"name": filepath.stem, "status": "ERROR", "priority": "P0", "type": "ERROR"})
+
+    total = len(details)
+    passing = sum(1 for d in details if d["status"] == "PASS")
+    failing = sum(1 for d in details if d["status"] == "FAIL")
+    errors = sum(1 for d in details if d["status"] == "ERROR")
+
+    return {
+        "file": str(filepath.relative_to(filepath.parent.parent.parent)),
+        "total": total,
+        "passing": passing,
+        "failing": failing,
+        "not_runnable": 0,
+        "errors": errors,
+        "details": details,
     }
 
 
@@ -590,10 +831,29 @@ def run_node_tests(
                 f"Bridge FAIL: {bridge['errors'][:120]}"
             )
 
-    # Properties
+    # Properties — use overlay cwd if property file is in PropertyTests/ or Tests/
     if test_type in ("all", "properties") and files["properties"]:
+        prop_file = files["properties"]
+        # Determine which overlay to use based on where the file lives
+        prop_cwd = None
+        if PROPERTY_TESTS_DIR in str(prop_file):
+            # PropertyTests/ overlay (Plausible/Mathlib)
+            overlay_lf = project / PROPERTY_TESTS_DIR / "lakefile.toml"
+            if overlay_lf.exists():
+                prop_cwd = project / PROPERTY_TESTS_DIR
+        else:
+            # Tests/ overlay (legacy)
+            overlay_lf = project / TESTS_DIR / "lakefile.toml"
+            if overlay_lf.exists():
+                prop_cwd = project / TESTS_DIR
+        # Detect eval-mode properties (no-Mathlib) — need --run for main
+        prop_source = prop_file.read_text(encoding="utf-8")
+        prop_run_main = _detect_eval_mode(prop_source)
         start = time.time()
-        run_result = run_lean_file(project, files["properties"], timeout)
+        run_result = run_lean_file(
+            project, prop_file, timeout,
+            run_main=prop_run_main, cwd=prop_cwd,
+        )
         run_result["time_seconds"] = round(time.time() - start, 1)
         props = parse_properties_result(files["properties"], run_result)
         result["properties"] = props
@@ -794,8 +1054,14 @@ def main():
                 print(f"ERROR: {result['error']}")
         sys.exit(0 if result.get("gemini_verdict") != "ERROR" else 1)
 
-    # Normal test execution
-    result = run_node_tests(project, args.node, args.type, args.timeout)
+    # Resolve bare virtual-phase IDs (e.g., "N1" → "NatOpt") so that
+    # find_test_files can locate Tests/Integration/NatOpt.lean.
+    resolved_name = resolve_node_name(project, args.node)
+    if resolved_name != args.node:
+        # Use the resolved name for test discovery
+        result = run_node_tests(project, resolved_name, args.type, args.timeout)
+    else:
+        result = run_node_tests(project, args.node, args.type, args.timeout)
 
     # Save results to file if requested
     if args.save_results:
