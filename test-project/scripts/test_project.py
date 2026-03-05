@@ -330,14 +330,21 @@ def validate_outsource(project: Path, dag_node_ids: list[str]) -> dict:
     )
 
     # Extract node IDs from outsource headers
+    # Supports both formats:
+    #   New: ### N26 — UnionFind
+    #   Old: ### F1S2 — UnionFind   (legacy phase-based IDs)
     outsource_nodes = []
-    node_header_re = re.compile(r"^### (N\S+)\s*[—–-]\s*(.+)", re.MULTILINE)
+    node_header_re = re.compile(
+        r"^### ([A-Z0-9][A-Za-z0-9.+*]*)\s*[—–-]\s*(.+)", re.MULTILINE
+    )
     for m in node_header_re.finditer(content):
         outsource_nodes.append(m.group(1))
     result["node_count"] = len(outsource_nodes)
 
     if not outsource_nodes:
-        result["errors"].append("No node specification headers found (### N... — ...)")
+        result["errors"].append(
+            "No node specification headers found (### ID — Name)"
+        )
         result["valid"] = False
     else:
         # Check node coverage vs dag
@@ -621,6 +628,19 @@ def aggregate_results(project: Path) -> str:
     meta = results.pop("_meta", {})
     bridge_status = meta.get("bridge_status", "MISSING")
 
+    # Build name↔id mapping from DAG phases for deduplication.
+    # results.json may have entries keyed by name ("UnionFind") or by
+    # DAG id ("N26") — we normalize everything to the DAG id.
+    name_to_id: dict[str, str] = {}
+    id_to_name: dict[str, str] = {}
+    for phase in phases:
+        for node in phase.get("nodes", []):
+            nid = node["id"]
+            nname = node.get("name", "")
+            if nname:
+                name_to_id[nname] = nid
+                id_to_name[nid] = nname
+
     # Aggregate totals
     total_nodes = 0
     total_props = 0
@@ -634,20 +654,37 @@ def aggregate_results(project: Path) -> str:
 
     node_rows = []
 
-    # Deduplicate: prefer entries with actual test data over bare node IDs
-    # e.g., "N2.1 ArithExpr Frontend" (has props/integ) over "N2.1" (nulls)
+    # Deduplicate: normalize keys to DAG node IDs, prefer entries with
+    # actual test data over bare node IDs.
+    # Handles: "N2.1", "N2.1 ArithExpr", "UnionFind" → all map to "N26".
     deduped: dict[str, tuple[str, dict]] = {}
     for node_id, node_result in sorted(results.items()):
         if not isinstance(node_result, dict) or "node" not in node_result:
             continue
         # Extract short ID (e.g., "N2.1" from "N2.1 ArithExpr Frontend")
         short_id = node_id.split()[0] if " " in node_id else node_id
+        # Normalize: if short_id is a name, map to DAG id
+        if short_id in name_to_id:
+            short_id = name_to_id[short_id]
         has_data = (
             node_result.get("properties") is not None
             or node_result.get("integration") is not None
         )
-        if short_id not in deduped or has_data:
+        # Prefer entries with integration/properties data over bare ones
+        existing = deduped.get(short_id)
+        if existing is None:
             deduped[short_id] = (node_id, node_result)
+        elif has_data:
+            # Merge: keep bridge from existing if new doesn't have it
+            old_id, old_result = existing
+            merged = dict(node_result)
+            if merged.get("bridge") is None and old_result.get("bridge"):
+                merged["bridge"] = old_result["bridge"]
+            if merged.get("properties") is None and old_result.get("properties"):
+                merged["properties"] = old_result["properties"]
+            if merged.get("integration") is None and old_result.get("integration"):
+                merged["integration"] = old_result["integration"]
+            deduped[short_id] = (node_id, merged)
 
     for short_id, (node_id, node_result) in sorted(deduped.items()):
         total_nodes += 1

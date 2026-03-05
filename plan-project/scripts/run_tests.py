@@ -108,9 +108,16 @@ def _matches_node(filename: str, node_clean: str, node_id: str) -> bool:
 
 # ─── Test Execution ─────────────────────────────────────────────────────────
 
-def run_lean_file(project: Path, filepath: Path, timeout: int = 300) -> dict:
-    """Run a Lean file via lake env lean and capture output."""
-    cmd = ["lake", "env", "lean", str(filepath)]
+def run_lean_file(project: Path, filepath: Path, timeout: int = 300,
+                  run_main: bool = False) -> dict:
+    """Run a Lean file via lake env lean and capture output.
+
+    If run_main=True, uses --run to execute the main function (for integration tests).
+    """
+    cmd = ["lake", "env", "lean"]
+    if run_main:
+        cmd.append("--run")
+    cmd.append(str(filepath))
 
     try:
         result = subprocess.run(
@@ -292,6 +299,44 @@ def parse_integration_result(
         "failing": failing,
         "errors": errors,
         "details": details,
+    }
+
+
+# ─── Bridge Parsing ──────────────────────────────────────────────────────────
+
+def parse_bridge_result(project: Path, run_result: dict) -> dict:
+    """Parse results from Tests/Bridge.lean.
+
+    Counts #check statements and bridge_* theorem witnesses.
+    """
+    bridge_file = project / TESTS_DIR / "Bridge.lean"
+    checks = []
+    witnesses = []
+
+    if bridge_file.exists():
+        try:
+            content = bridge_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            content = ""
+        for m in re.finditer(r"^#check\s+@?(\S+)", content, re.MULTILINE):
+            checks.append(m.group(1))
+        for m in re.finditer(
+            r"^(theorem|lemma)\s+(bridge_\w+)", content, re.MULTILINE
+        ):
+            witnesses.append(m.group(2))
+
+    exit_code = run_result.get("exit_code", -1)
+    stderr = run_result.get("stderr", "")
+    has_errors = exit_code != 0 or "error:" in stderr.lower()
+
+    return {
+        "file": str(TESTS_DIR + "/Bridge.lean"),
+        "status": "FAIL" if has_errors else "PASS",
+        "checks": len(checks),
+        "witnesses": len(witnesses),
+        "check_names": checks,
+        "witness_names": witnesses,
+        "errors": stderr.strip() if has_errors else "",
     }
 
 
@@ -523,12 +568,27 @@ def run_node_tests(
 
     result = {
         "node": node_name,
+        "bridge": None,
         "properties": None,
         "integration": None,
         "all_pass": True,
         "p0_pass": True,
         "blocking_failures": [],
     }
+
+    # Bridge (run once — checks formal theorem coupling)
+    bridge_file = project / TESTS_DIR / "Bridge.lean"
+    if bridge_file.exists():
+        start = time.time()
+        bridge_run = run_lean_file(project, bridge_file, timeout)
+        bridge_run["time_seconds"] = round(time.time() - start, 1)
+        bridge = parse_bridge_result(project, bridge_run)
+        result["bridge"] = bridge
+        if bridge["status"] != "PASS":
+            result["all_pass"] = False
+            result["blocking_failures"].append(
+                f"Bridge FAIL: {bridge['errors'][:120]}"
+            )
 
     # Properties
     if test_type in ("all", "properties") and files["properties"]:
@@ -564,10 +624,10 @@ def run_node_tests(
         if props["errors"] > 0:
             result["all_pass"] = False
 
-    # Integration
+    # Integration (use --run to execute main)
     if test_type in ("all", "integration") and files["integration"]:
         start = time.time()
-        run_result = run_lean_file(project, files["integration"], timeout)
+        run_result = run_lean_file(project, files["integration"], timeout, run_main=True)
         run_result["time_seconds"] = round(time.time() - start, 1)
         integ = parse_integration_result(files["integration"], run_result)
         result["integration"] = integ
@@ -605,6 +665,20 @@ def format_text_report(result: dict) -> str:
     lines.append(f"  TEST RESULTS: {node}")
     lines.append(f"{'=' * 56}")
     lines.append("")
+
+    bridge = result.get("bridge")
+    if bridge:
+        lines.append(f"FORMAL BRIDGE ({bridge['file']}):")
+        lines.append(f"  Status: {bridge['status']}")
+        lines.append(f"  #check statements: {bridge['checks']}")
+        lines.append(f"  Hypothesis witnesses: {bridge['witnesses']}")
+        for name in bridge.get("check_names", []):
+            lines.append(f"    CHK  {name}")
+        for name in bridge.get("witness_names", []):
+            lines.append(f"    WIT  {name}")
+        if bridge["errors"]:
+            lines.append(f"  Errors: {bridge['errors'][:200]}")
+        lines.append("")
 
     props = result.get("properties")
     if props:
@@ -647,6 +721,25 @@ def format_text_report(result: dict) -> str:
         lines.append("BLOCKING FAILURES:")
         for f in result["blocking_failures"]:
             lines.append(f"  - {f}")
+
+    # Coverage summary (3 layers)
+    lines.append("")
+    lines.append("COVERAGE SUMMARY:")
+    if bridge:
+        b_str = f"{bridge['status']} ({bridge['checks']} #check, {bridge['witnesses']} witnesses)"
+    else:
+        b_str = "MISSING (no Tests/Bridge.lean)"
+    lines.append(f"  Layer 1 (Formal Bridge):  {b_str}")
+    if props:
+        p_str = f"{props['passing']}/{props['total']} pass"
+    else:
+        p_str = "N/A (no property tests)"
+    lines.append(f"  Layer 2 (Properties):     {p_str}")
+    if integ:
+        i_str = f"{integ['passing']}/{integ['total']} pass"
+    else:
+        i_str = "N/A (no integration tests)"
+    lines.append(f"  Layer 3 (Integration):    {i_str}")
 
     lines.append(f"{'─' * 56}")
     return "\n".join(lines)
@@ -715,9 +808,11 @@ def main():
             except (json.JSONDecodeError, OSError):
                 existing = {}
         existing[args.node] = result
+        bridge_info = result.get("bridge")
         existing["_meta"] = {
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "project": str(project),
+            "bridge_status": bridge_info["status"] if bridge_info else "MISSING",
         }
         save_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
