@@ -1,6 +1,6 @@
 # claude-code-skills
 
-Coleccion de 13 custom skills y 11 hooks para [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (la CLI oficial de Anthropic). Cada skill es un directorio independiente que puedes copiar a tu `~/.claude/skills/`, y los hooks se copian a `~/.claude/hooks/`.
+Coleccion de 14 custom skills y 11 hooks para [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (la CLI oficial de Anthropic). Cada skill es un directorio independiente que puedes copiar a tu `~/.claude/skills/`, y los hooks se copian a `~/.claude/hooks/`.
 
 ## Que es esto
 
@@ -74,6 +74,7 @@ Esto descarga el dataset LeanDojo (~150 MB) y el modelo `tacgen-byt5-small` (~1.
 | Skill | Comando | Descripcion |
 |-------|---------|-------------|
 | **study-biblio** | `/study-biblio` | Indexa PDFs usando Gemini Flash. Genera resumenes, indices por carpeta, indice global y grafo conceptual. Incremental |
+| **test-project** | `/test-project` | Testing end-to-end de proyecto Lean 4: genera specs (Gemini), escribe tests (subagente), ejecuta y produce reporte de 3 capas |
 | **autopsy** | `/autopsy` | Post-mortem de proyecto Lean 4: cruza README claims x DAG x cobertura de codigo. Sugiere propiedades SlimCheck |
 | **tidy-project** | `/tidy-project` | Reformatea ARCHITECTURE.md y BENCHMARKS.md al formato estandar. Extrae lecciones y genera dag.json |
 | **telegram** | `/telegram` | Modo away: activa/desactiva notificaciones Telegram para trabajo autonomo sin supervision |
@@ -196,6 +197,10 @@ insights (pre-planificacion)
 
 lean4-subagents -----------> lean4-theorem-proving (obligatorio)
 
+test-project
+    |---> plan-project/scripts/generate_tests.py (Gemini)
+    +---> plan-project/scripts/run_tests.py
+
 tidy-project                 (independiente)
 autopsy                      (independiente)
 load-lessons                 (independiente)
@@ -316,6 +321,10 @@ claude-code-skills/
 │   └── scripts/                # 7 indexer scripts
 ├── telegram/
 │   └── SKILL.md
+├── test-project/
+│   ├── SKILL.md
+│   └── scripts/
+│       └── test_project.py
 └── tidy-project/
     ├── SKILL.md
     └── scripts/
