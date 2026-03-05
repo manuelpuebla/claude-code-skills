@@ -1,234 +1,123 @@
 #!/usr/bin/env python3
 """
-Load Lessons - Carga selectiva de lecciones aprendidas
+Load Lessons - Thin wrapper around query_lessons.py
 
-Uso:
-    python3 load_lessons.py <dominio> [opciones]
+Delegates all operations to the centralized query_lessons.py script,
+which supports keyword, semantic, and hybrid search modes.
 
-Dominios:
-    lean4   - Verificación formal en Lean 4
+Usage:
+    python3 load_lessons.py <domain> [options]
 
-Opciones:
-    --category, -c CAT    Cargar archivo de categoría
-    --problem, -p "text"  Buscar por descripción del problema
-    --list, -l            Listar categorías disponibles
-    --critical            Mostrar lecciones críticas
+Domains:
+    lean4   - Formal verification in Lean 4 (471+ lessons)
+
+Options:
+    --search, -s "text"     Keyword search
+    --hybrid, -q "text"     Hybrid keyword+semantic search (recommended)
+    --semantic "text"       Pure semantic search
+    --problem, -p "text"    Problem lookup from quick-reference table
+    --lesson, -l ID         Get specific lesson by ID (e.g., L-153)
+    --section SEC           Get full section (e.g., §47)
+    --related, -r ID        Show related lessons from graph
+    --list                  List all sections and lesson counts
 """
 
-import argparse
-import os
-import re
+import subprocess
 import sys
 from pathlib import Path
 
-# Base path for lessons
-LESSONS_BASE = Path.home() / "Documents" / "claudio" / "lecciones"
+QUERY_SCRIPT = Path.home() / "Documents" / "claudio" / "lecciones" / "scripts" / "query_lessons.py"
 
-# Domain configurations
-DOMAINS = {
-    "lean4": {
-        "path": LESSONS_BASE / "lean4",
-        "index": "INDEX.md",
-        "categories": {
-            "tacticas": "tacticas.md",
-            "campos-finitos": "campos-finitos.md",
-            "induccion": "induccion.md",
-            "arquitectura": "arquitectura.md",
-            "anti-patrones": "anti-patrones.md",
-            "qa-workflow": "qa-workflow.md",
-        },
-        "critical": [
-            ("L-015", "ZMod.val_injective - NUNCA trabajar directo con ZMod grande"),
-            ("L-023", "omega necesita bounds explícitos - construir cadena manual"),
-            ("L-049", "termination_by + decreasing_by para eliminar partial"),
-            ("L-035", "Intentar probar axioma es la mejor auditoría"),
-            ("L-078", "Statement más fuerte = IH más fuerte"),
-        ],
-    }
-}
+DOMAINS = {"lean4"}
 
 
-def load_index(domain: str) -> str:
-    """Load and return the INDEX.md content for a domain."""
-    config = DOMAINS.get(domain)
-    if not config:
-        return f"Error: Dominio '{domain}' no encontrado. Disponibles: {list(DOMAINS.keys())}"
-
-    index_path = config["path"] / config["index"]
-    if not index_path.exists():
-        return f"Error: INDEX.md no encontrado en {index_path}"
-
-    return index_path.read_text()
-
-
-def load_category(domain: str, category: str) -> str:
-    """Load and return a specific category file."""
-    config = DOMAINS.get(domain)
-    if not config:
-        return f"Error: Dominio '{domain}' no encontrado."
-
-    if category not in config["categories"]:
-        available = ", ".join(config["categories"].keys())
-        return f"Error: Categoría '{category}' no encontrada. Disponibles: {available}"
-
-    cat_path = config["path"] / config["categories"][category]
-    if not cat_path.exists():
-        return f"Error: Archivo {cat_path} no encontrado."
-
-    return cat_path.read_text()
-
-
-def search_problem(domain: str, problem: str) -> str:
-    """Search INDEX.md for relevant lessons based on problem description."""
-    config = DOMAINS.get(domain)
-    if not config:
-        return f"Error: Dominio '{domain}' no encontrado."
-
-    index_path = config["path"] / config["index"]
-    if not index_path.exists():
-        return f"Error: INDEX.md no encontrado."
-
-    index_content = index_path.read_text().lower()
-    problem_lower = problem.lower()
-
-    # Search for matching rows in the problem table
-    results = []
-
-    # Find the "Búsqueda Rápida por Problema" section
-    lines = index_path.read_text().split('\n')
-    in_table = False
-
-    for line in lines:
-        if "Búsqueda Rápida por Problema" in line:
-            in_table = True
-            continue
-        if in_table and line.startswith('|') and '---' not in line:
-            # Check if any word from problem matches this line
-            words = problem_lower.split()
-            if any(word in line.lower() for word in words):
-                results.append(line)
-        if in_table and line.startswith('##') and "Búsqueda" not in line:
-            break
-
-    if not results:
-        return f"No se encontraron lecciones para '{problem}'.\n\nConsulta el índice completo:\n{load_index(domain)}"
-
-    output = f"Lecciones encontradas para '{problem}':\n\n"
-    output += "| Problema | Archivo | Secciones |\n"
-    output += "|----------|---------|----------|\n"
-    for r in results:
-        output += r + "\n"
-
-    # Extract category from first result and suggest loading it
-    if results:
-        match = re.search(r'`([^`]+\.md)`', results[0])
-        if match:
-            cat_file = match.group(1).replace('.md', '')
-            output += f"\n**Sugerencia**: Cargar categoría con:\n"
-            output += f"  /load-lessons {domain} -c {cat_file}\n"
-
-    return output
-
-
-def list_categories(domain: str) -> str:
-    """List available categories for a domain."""
-    config = DOMAINS.get(domain)
-    if not config:
-        return f"Error: Dominio '{domain}' no encontrado."
-
-    output = f"Categorías disponibles para {domain}:\n\n"
-    output += "| Categoría | Archivo | Descripción |\n"
-    output += "|-----------|---------|-------------|\n"
-
-    descriptions = {
-        "tacticas": "simp, omega, rfl, congr, split_ifs",
-        "campos-finitos": "ZMod, GoldilocksField, homomorfismos",
-        "induccion": "terminación, WF-recursion, partial",
-        "arquitectura": "bridge lemmas, axiomatización, Memory",
-        "anti-patrones": "errores comunes, tipos inadecuados",
-        "qa-workflow": "integración QA, consulta expertos",
-    }
-
-    for cat, filename in config["categories"].items():
-        desc = descriptions.get(cat, "")
-        output += f"| {cat} | {filename} | {desc} |\n"
-
-    return output
-
-
-def show_critical(domain: str) -> str:
-    """Show critical lessons that should be memorized."""
-    config = DOMAINS.get(domain)
-    if not config:
-        return f"Error: Dominio '{domain}' no encontrado."
-
-    output = f"Lecciones Críticas - {domain.upper()} (MEMORIZAR)\n"
-    output += "=" * 50 + "\n\n"
-
-    for lesson_id, description in config["critical"]:
-        output += f"**{lesson_id}**: {description}\n\n"
-
-    output += "\nEstas lecciones resuelven los problemas más frecuentes.\n"
-    output += "Aplicarlas ANTES de buscar otras soluciones.\n"
-
-    return output
+def run_query(*args: str) -> None:
+    """Run query_lessons.py with given arguments, print output."""
+    result = subprocess.run(
+        [sys.executable, str(QUERY_SCRIPT), *args],
+        capture_output=True, text=True,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode != 0 and result.stderr:
+        print(result.stderr, file=sys.stderr, end="")
+    sys.exit(result.returncode)
 
 
 def main():
+    import argparse
+
     parser = argparse.ArgumentParser(
-        description="Carga selectiva de lecciones aprendidas",
+        description="Load Lean 4 lessons (delegates to query_lessons.py)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Ejemplos:
-  %(prog)s lean4                      # Muestra índice
-  %(prog)s lean4 --list               # Lista categorías
-  %(prog)s lean4 -c campos-finitos    # Carga categoría
-  %(prog)s lean4 -p "ZMod timeout"    # Busca por problema
-  %(prog)s lean4 --critical           # Lecciones críticas
-        """
+Examples:
+  %(prog)s lean4 --list                              # List sections
+  %(prog)s lean4 -q "omega multiplication"            # Hybrid search (recommended)
+  %(prog)s lean4 --semantic "nonlinear arithmetic"    # Semantic search
+  %(prog)s lean4 -s "omega"                           # Keyword search
+  %(prog)s lean4 -p "omega no funciona"               # Problem lookup
+  %(prog)s lean4 -l L-153                             # Exact lesson
+  %(prog)s lean4 -r L-153                             # Related lessons
+        """,
     )
 
     parser.add_argument("domain", nargs="?", default=None,
-                        help="Dominio de lecciones (lean4, rust, etc.)")
-    parser.add_argument("-c", "--category", type=str,
-                        help="Cargar archivo de categoría específica")
-    parser.add_argument("-p", "--problem", type=str,
-                        help="Buscar lección por descripción del problema")
-    parser.add_argument("-l", "--list", action="store_true",
-                        help="Listar categorías disponibles")
-    parser.add_argument("--critical", action="store_true",
-                        help="Mostrar lecciones críticas")
+                        help="Domain (lean4)")
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-q", "--hybrid", type=str,
+                       help="Hybrid keyword+semantic search (recommended)")
+    group.add_argument("--semantic", type=str,
+                       help="Pure semantic search")
+    group.add_argument("-s", "--search", type=str,
+                       help="Keyword search")
+    group.add_argument("-p", "--problem", type=str,
+                       help="Problem lookup from quick-reference table")
+    group.add_argument("-l", "--lesson", type=str,
+                       help="Get specific lesson by ID")
+    group.add_argument("--section", type=str,
+                       help="Get full section")
+    group.add_argument("-r", "--related", type=str,
+                       help="Related lessons from graph")
+    group.add_argument("--list", action="store_true",
+                       help="List all sections")
 
     args = parser.parse_args()
 
-    # No domain specified
     if not args.domain:
-        print("Dominios disponibles:")
-        for d in DOMAINS:
-            print(f"  {d}")
-        print("\nUso: load_lessons.py <dominio> [opciones]")
-        print("Ayuda: load_lessons.py --help")
+        print("Available domains: lean4")
+        print(f"\nUsage: {parser.prog} <domain> [options]")
+        print(f"Help:  {parser.prog} --help")
         return
 
-    domain = args.domain.lower()
-
-    if domain not in DOMAINS:
-        print(f"Error: Dominio '{domain}' no encontrado.")
-        print(f"Disponibles: {', '.join(DOMAINS.keys())}")
+    if args.domain.lower() not in DOMAINS:
+        print(f"Error: domain '{args.domain}' not found. Available: {', '.join(DOMAINS)}")
         sys.exit(1)
 
-    # Handle options
-    if args.critical:
-        print(show_critical(domain))
-    elif args.list:
-        print(list_categories(domain))
-    elif args.category:
-        print(load_category(domain, args.category))
+    if not QUERY_SCRIPT.exists():
+        print(f"Error: query_lessons.py not found at {QUERY_SCRIPT}", file=sys.stderr)
+        sys.exit(1)
+
+    # Delegate to query_lessons.py
+    if args.hybrid:
+        run_query("--hybrid", args.hybrid)
+    elif args.semantic:
+        run_query("--semantic", args.semantic)
+    elif args.search:
+        run_query("--search", args.search)
     elif args.problem:
-        print(search_problem(domain, args.problem))
+        run_query("--problem", args.problem)
+    elif args.lesson:
+        run_query("--lesson", args.lesson)
+    elif args.section:
+        run_query("--section", args.section)
+    elif args.related:
+        run_query("--related", args.related)
+    elif args.list:
+        run_query("--list")
     else:
-        # Default: show index
-        print(load_index(domain))
+        run_query("--list")
 
 
 if __name__ == "__main__":

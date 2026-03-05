@@ -2,7 +2,7 @@
 name: plan-project
 description: Orquestador de planificación que usa subagentes para revisar bibliografía, lecciones, y consultar QA antes de presentar un plan estructurado. Optimizado para Opus 4.6 (Agent Teams, Adaptive Thinking, 1M Context, Compaction).
 allowed-tools: Task, Bash(python3 *), Read, Glob, Grep
-argument-hint: "\"descripción de la tarea\" [--context fase2] [--domain lean4] [--effort auto]"
+argument-hint: "\"descripción de la tarea\" [--context fase2] [--domain lean4] [--effort auto] [--study-context]"
 ---
 
 # Plan Project: Orquestador de Planificación (Opus 4.6)
@@ -11,9 +11,10 @@ argument-hint: "\"descripción de la tarea\" [--context fase2] [--domain lean4] 
 
 Si el usuario invoca con `?` o `--help`, mostrar:
 ```
-/plan-project "tarea" [--context fase2] [--domain lean4] [--effort auto|low|medium|high|max]
+/plan-project "tarea" [--context fase2] [--domain lean4] [--effort auto|low|medium|high|max] [--study-context]
 Workflow: Bibliografía + Lecciones + Contexto + Expertos + DAG → Plan Topológico → QA → Presentar
 Ejecución: Scout Phase (code map) → Agent Teams (paralelo) o Secuencial → Checkpoints
+  --study-context   Genera contexto de estudio por nodo (papers, lessons, libraries) en dag.json
 ```
 
 ## Activation
@@ -66,8 +67,9 @@ NO usar query_graph.py. Retorna: documentos relevantes (nombre + 1 línea) + 3-5
 
 **Agent 2: Lecciones** — Task(Explore, haiku)
 ```
-"Lee ~/Documents/claudio/lecciones/{DOMAIN}/INDEX.md
-Identifica 5-10 lecciones relevantes. Grep selectivo por L-ID en categoría correspondiente.
+"Ejecuta: python3 ~/Documents/claudio/lecciones/scripts/query_lessons.py --hybrid '{TASK}'
+Si el resultado es insuficiente, ejecuta una segunda búsqueda con keywords más específicos.
+Para las top 3-5 lecciones relevantes, ejecuta --lesson <ID> para leer el contenido completo.
 Retorna: IDs + título (1 línea c/u), CRÍTICAS con contenido (máx 3 líneas c/u), anti-patrones."
 ```
 
@@ -113,6 +115,22 @@ Retorna tabla: Teorema | Dificultad | Estrategia (1 línea) | Lemas clave"
 Si FUNDACIONAL evaluado MUY_ALTA → incluir fase previa de investigación.
 
 **5c. Ensamblar** como secuencia de bloques:
+
+**5c-study. Contexto de estudio por nodo** (solo si `--study-context`):
+Para CADA nodo del DAG, generar un campo `study` usando la información recolectada por Agents 1-4:
+```json
+"study": {
+  "papers": ["carpeta/summary.md"],
+  "lessons": ["L-337", "L-203"],
+  "libraries": ["LeanHash:SboxProperties"],
+  "notes": "Hint breve del planificador para el worker"
+}
+```
+- `papers`: summaries de `biblioteca/indices/` relevantes al nodo (de Agent 1)
+- `lessons`: IDs de lecciones aplicables al nodo (de Agent 2)
+- `libraries`: `librería:módulo` con teoremas reutilizables (de Agent 1/3, cruzar con librerías internas)
+- `notes`: 1-2 líneas de contexto estratégico del planificador
+Si `--study-context` NO está activo: NO generar campo `study`. Los nodos quedan sin él y el workflow es idéntico al actual.
 
 **Terminología obligatoria:**
 - **Nodo** = unidad individual del DAG (FUNDACIONAL / CRÍTICO / PARALELO / HOJA). Unidad de verificación.
@@ -260,7 +278,8 @@ El JSON del plan debe tener formato:
 ```json
 {
   "phases": [{"id": "faseN", "name": "...", "description": "...",
-    "nodes": [{"id": "N1.1", "name": "...", "type": "CRITICO", "files": [...], "deps": [...], "blocks": [...]}],
+    "nodes": [{"id": "N1.1", "name": "...", "type": "CRITICO", "files": [...], "deps": [...], "blocks": [...],
+               "study": {"papers": [...], "lessons": [...], "libraries": [...], "notes": "..."}}],
     "blocks": [{"id": "B1", "name": "...", "nodes": ["N1.1"]}]
   }],
   "rubric": {"correctness": [...], "performance": [...], "quality": [...]},
