@@ -548,11 +548,13 @@ def parse_integration_result(
 def parse_bridge_result(project: Path, run_result: dict) -> dict:
     """Parse results from Tests/Bridge.lean.
 
-    Counts #check statements and bridge_* theorem witnesses.
+    Counts #check statements, bridge_* theorem witnesses, and joint witnesses
+    (example : <type> := theorem_name ...).
     """
     bridge_file = project / TESTS_DIR / "Bridge.lean"
     checks = []
     witnesses = []
+    joint_witnesses = []
 
     if bridge_file.exists():
         try:
@@ -565,6 +567,11 @@ def parse_bridge_result(project: Path, run_result: dict) -> dict:
             r"^(theorem|lemma)\s+(bridge_\w+)", content, re.MULTILINE
         ):
             witnesses.append(m.group(2))
+        # Joint witnesses: example : <type> := <theorem_name> <args>
+        for m in re.finditer(
+            r"^example\s+:", content, re.MULTILINE
+        ):
+            joint_witnesses.append(f"joint_witness@{m.start()}")
 
     exit_code = run_result.get("exit_code", -1)
     stderr = run_result.get("stderr", "")
@@ -575,6 +582,7 @@ def parse_bridge_result(project: Path, run_result: dict) -> dict:
         "status": "FAIL" if has_errors else "PASS",
         "checks": len(checks),
         "witnesses": len(witnesses),
+        "joint_witnesses": len(joint_witnesses),
         "check_names": checks,
         "witness_names": witnesses,
         "errors": stderr.strip() if has_errors else "",
@@ -932,6 +940,7 @@ def format_text_report(result: dict) -> str:
         lines.append(f"  Status: {bridge['status']}")
         lines.append(f"  #check statements: {bridge['checks']}")
         lines.append(f"  Hypothesis witnesses: {bridge['witnesses']}")
+        lines.append(f"  Joint witnesses: {bridge.get('joint_witnesses', 0)}")
         for name in bridge.get("check_names", []):
             lines.append(f"    CHK  {name}")
         for name in bridge.get("witness_names", []):
@@ -986,7 +995,8 @@ def format_text_report(result: dict) -> str:
     lines.append("")
     lines.append("COVERAGE SUMMARY:")
     if bridge:
-        b_str = f"{bridge['status']} ({bridge['checks']} #check, {bridge['witnesses']} witnesses)"
+        jw = bridge.get('joint_witnesses', 0)
+        b_str = f"{bridge['status']} ({bridge['checks']} #check, {bridge['witnesses']} witnesses, {jw} joint)"
     else:
         b_str = "MISSING (no Tests/Bridge.lean)"
     lines.append(f"  Layer 1 (Formal Bridge):  {b_str}")

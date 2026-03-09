@@ -229,6 +229,39 @@ def read_toolchain(project: Path) -> str:
     return "unknown"
 
 
+def scan_spec_theorems(project: Path) -> list[dict]:
+    """Scan *Spec.lean files for formal theorems and their hypotheses.
+
+    Returns list of dicts: {name, file, hypotheses: [str]}.
+    """
+    specs = []
+    for lean_file in sorted(project.rglob("*.lean")):
+        if ".lake" in str(lean_file):
+            continue
+        if not lean_file.stem.endswith("Spec"):
+            continue
+        rel = str(lean_file.relative_to(project))
+        try:
+            content = lean_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for m in re.finditer(
+            r"^(theorem|lemma)\s+(\w+)", content, re.MULTILINE,
+        ):
+            name = m.group(2)
+            # Extract hypothesis types: (hXxx : TypeName) patterns
+            sig_start = m.start()
+            sig_end = content.find(":=", sig_start)
+            if sig_end == -1:
+                sig_end = content.find("by", sig_start)
+            if sig_end == -1:
+                sig_end = min(sig_start + 500, len(content))
+            sig = content[sig_start:sig_end]
+            hyps = re.findall(r"\(h\w*\s*:\s*(\w+)", sig)
+            specs.append({"name": name, "file": rel, "hypotheses": hyps})
+    return specs
+
+
 # ─── Spec Generation ────────────────────────────────────────────────────────
 
 SPEC_PROMPT = """You are a Senior QA Architect designing a test plan for a Lean 4 project.
@@ -252,6 +285,24 @@ You do NOT write Lean code. You design test SPECIFICATIONS that another engineer
 {rubric}
 
 ## Project uses Mathlib: {has_mathlib}
+
+## Formal Theorems in *Spec.lean files
+{spec_theorems_text}
+
+## COUPLING REQUIREMENT (MANDATORY for Lean 4 formal projects)
+If formal theorems exist above, you MUST add a BRIDGE section at the end of your output:
+1. For each formal theorem relevant to this node, specify a #check statement
+2. For each hypothesis Prop, indicate if it can be IO-checked (Decidable) or needs a proof witness
+3. For integration tests exercising formally-verified functions, specify semantic equivalence checks
+
+Use this format:
+```
+BRIDGE:
+- [B1] CHECK: #check @theorem_name ConcreteType1 ConcreteType2
+- [B2] WITNESS: hypothesis_type — egraph_empty_wf or similar witness theorem
+- [B3] SEMANTIC: evalExpr extracted_expr env == expected_value
+```
+If no formal theorems exist for this node, write: `BRIDGE: (none — no formal specs for this node)`
 
 ## Your Task
 
@@ -320,9 +371,32 @@ INTEGRATION:
 ```"""
 
 
+def _format_spec_theorems(spec_theorems: list[dict], node_files: list[str]) -> str:
+    """Format spec theorems relevant to a node for prompt injection."""
+    if not spec_theorems:
+        return "(no *Spec.lean files found in project)"
+    # Filter to theorems whose file shares a prefix with node files
+    node_stems = set()
+    for f in node_files:
+        stem = Path(f).stem.replace("Spec", "").replace("spec", "")
+        node_stems.add(stem.lower())
+    relevant = [
+        t for t in spec_theorems
+        if any(s in Path(t["file"]).stem.lower() for s in node_stems)
+    ]
+    if not relevant:
+        relevant = spec_theorems  # fallback: show all
+    lines = []
+    for t in relevant[:20]:
+        hyps = ", ".join(t["hypotheses"]) if t["hypotheses"] else "(none)"
+        lines.append(f"- {t['name']} ({t['file']}) — hypotheses: {hyps}")
+    return "\n".join(lines) if lines else "(none found)"
+
+
 def generate_node_spec(
     client, node: dict, signatures: str,
     stubs: str, rubric: str, has_mathlib: bool,
+    spec_theorems: list[dict] | None = None,
 ) -> dict:
     """Generate test specifications for a single node via Gemini."""
     node_id = node["id"]
@@ -330,12 +404,17 @@ def generate_node_spec(
     node_type = node.get("type", "HOJA")
     files = node.get("files", [])
 
+    spec_theorems_text = _format_spec_theorems(
+        spec_theorems or [], files,
+    )
+
     prompt = SPEC_PROMPT.format(
         node_id=node_id, node_name=node_name, node_type=node_type,
         files=", ".join(files), signatures=signatures,
         stubs=stubs or "(none defined yet)",
         rubric=rubric or "(none defined yet)",
         has_mathlib="Yes" if has_mathlib else "No",
+        spec_theorems_text=spec_theorems_text,
     )
 
     print(f"  Designing specs for {node_id}...", file=sys.stderr)
@@ -366,6 +445,7 @@ def write_outsource_md(
     project: Path, dag: dict,
     specs: list[dict], rubric_text: str,
     has_mathlib: bool,
+    spec_theorems: list[dict] | None = None,
 ):
     """Write TESTS_OUTSOURCE.md — self-contained spec for the testing session."""
     outsource_path = project / "TESTS_OUTSOURCE.md"
@@ -489,6 +569,74 @@ def write_outsource_md(
     lines.append(f"| Archivos .lean a crear | {len(specs) * 2} |")
     lines.append("")
 
+    # ── Formal Bridge Requirements ──
+    if spec_theorems:
+        lines.append("---")
+        lines.append("")
+        lines.append("## Formal Bridge Requirements")
+        lines.append("")
+        lines.append("The testing session **MUST** create `Tests/Bridge.lean` that verifies")
+        lines.append("formal theorems apply to the concrete test domain.")
+        lines.append("")
+        lines.append("### Theorems to instantiate (#check)")
+        lines.append("")
+        lines.append("| Theorem | Source | #check statement |")
+        lines.append("|---------|--------|-----------------|")
+        for t in spec_theorems:
+            lines.append(
+                f"| `{t['name']}` | `{t['file']}` "
+                f"| `#check @{t['name']}` |"
+            )
+        lines.append("")
+        # Collect unique hypothesis types
+        all_hyps = set()
+        for t in spec_theorems:
+            all_hyps.update(t["hypotheses"])
+        if all_hyps:
+            lines.append("### Hypothesis types found")
+            lines.append("")
+            for h in sorted(all_hyps):
+                lines.append(
+                    f"- `{h}` — verify this holds for the concrete test domain"
+                )
+            lines.append("")
+        lines.append("### Bridge.lean template")
+        lines.append("")
+        lines.append("```lean")
+        lines.append("-- Tests/Bridge.lean — Formal coupling verification")
+        lines.append("import <ProjectLib>  -- replace with actual import")
+        lines.append("")
+        lines.append("-- Layer 1a: Verify theorems apply to concrete domain")
+        for t in spec_theorems[:15]:
+            lines.append(f"#check @{t['name']}")
+        lines.append("")
+        lines.append("-- Layer 1b: Joint witnesses (CRITICAL for pipeline theorems)")
+        lines.append("-- For each pipeline theorem with >=2 Prop hypotheses,")
+        lines.append("-- apply it with ALL hypotheses discharged on concrete values:")
+        lines.append("-- example : <conclusion> := theorem_name concrete_val (proof_h1) (proof_h2)")
+        lines.append("")
+        lines.append("-- Layer 1c: Individual witnesses (for complex single hypotheses)")
+        lines.append("-- theorem bridge_xxx : HypType := ...")
+        lines.append("```")
+        lines.append("")
+
+        # Canonical examples section for pipeline theorems
+        pipeline_thms = [t for t in spec_theorems if any(
+            kw in t["name"].lower() for kw in
+            ("sound", "correct", "pipeline", "e2e", "bridge", "preserv")
+        )]
+        if pipeline_thms:
+            lines.append("### Canonical Examples")
+            lines.append("")
+            lines.append("For each pipeline theorem below, the testing session should write")
+            lines.append("at least one `#eval` in `Tests/Integration/` demonstrating the")
+            lines.append("theorem's conclusion with concrete values.")
+            lines.append("")
+            for t in pipeline_thms[:10]:
+                lines.append(f"- **`{t['name']}`**: Construct concrete inputs satisfying "
+                             f"hypotheses and show the conclusion holds via `#eval`")
+            lines.append("")
+
     outsource_path.write_text("\n".join(lines), encoding="utf-8")
     return str(outsource_path)
 
@@ -534,6 +682,7 @@ def main():
     has_mathlib = detect_mathlib(project)
     rubric_text = load_rubric_criteria(project)
     properties = load_benchmarks_properties(project)
+    spec_theorems = scan_spec_theorems(project)
 
     # Determine nodes to process
     if args.all:
@@ -564,6 +713,7 @@ def main():
 
         spec = generate_node_spec(
             client, node, signatures, stubs, rubric_text, has_mathlib,
+            spec_theorems=spec_theorems,
         )
         all_specs.append(spec)
 
@@ -574,6 +724,7 @@ def main():
     # Write TESTS_OUTSOURCE.md
     outsource_file = write_outsource_md(
         project, dag, all_specs, rubric_text, has_mathlib,
+        spec_theorems=spec_theorems,
     )
     print(f"Generated: {outsource_file}", file=sys.stderr)
 

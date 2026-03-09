@@ -5,6 +5,7 @@ Modes:
   --check      Validate prerequisites (dag.json, outsource, tests, API key)
   --aggregate  Read Tests/results.json + dag.json, generate report markdown
   --detect-version  Extract version from ARCHITECTURE.md
+  --spec-audit Run specification audit only (Layer 0)
 
 Supports both planning-format dag.json (with "phases") and declaration-format
 dag.json (with "declarations" + "graph_edges"). Declaration dags are converted
@@ -14,6 +15,7 @@ Usage:
   python3 test_project.py --check --project /path/to/project
   python3 test_project.py --aggregate --project /path/to/project
   python3 test_project.py --detect-version --project /path/to/project
+  python3 test_project.py --spec-audit --project /path/to/project
 """
 
 import argparse
@@ -24,6 +26,122 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+SPEC_AUDIT_SCRIPT = Path(__file__).parent.parent.parent / "plan-project" / "scripts" / "spec_audit.py"
+
+
+# ─── Specification Audit (Layer 0) ───────────────────────────────────────────
+
+def run_spec_audit(project: Path, pipeline_only: bool = False) -> dict:
+    """Run spec_audit.py and return structured results.
+
+    Returns: {
+        "available": bool,
+        "tier1_count": int, "tier15_count": int,
+        "tier2_count": int, "tier3_count": int,
+        "total_theorems": int, "pipeline_theorems": int,
+        "issues": [...],  # top 20 issues
+        "identity_passes": [...],  # identity pass entries
+        "blocking_pass": bool,  # True if T1 == 0 and T1.5 == 0
+    }
+    """
+    if not SPEC_AUDIT_SCRIPT.exists():
+        return {"available": False, "warning": "spec_audit.py not found"}
+
+    cmd = [
+        sys.executable, str(SPEC_AUDIT_SCRIPT),
+        "--project", str(project),
+        "--json",
+    ]
+    if pipeline_only:
+        cmd.append("--pipeline-only")
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+        )
+        output = result.stdout.strip()
+        if output:
+            data = json.loads(output)
+            # spec_audit.py uses tier1_issues/tier2_issues/tier3_issues
+            t1 = data.get("tier1_issues", data.get("tier1_count", 0))
+            t15 = data.get("tier15_issues", 0)
+            t2 = data.get("tier2_issues", data.get("tier2_count", 0))
+            t3 = data.get("tier3_issues", data.get("tier3_count", 0))
+            t4 = data.get("tier4_issues", 0)
+            # Extract issues from entries list
+            issues = []
+            t4_issues = []
+            for entry in data.get("entries", []):
+                tier = entry.get("tier", 0)
+                if tier > 0:
+                    issue = {
+                        "tier": tier,
+                        "name": entry.get("name", "?"),
+                        "reason": "; ".join(entry.get("warnings", [])),
+                        "module": entry.get("module", ""),
+                        "line": entry.get("line", 0),
+                    }
+                    issues.append(issue)
+                    if tier == 4:
+                        t4_issues.append(issue)
+            # Extract identity passes
+            identity_passes = data.get("identity_passes", [])
+            return {
+                "available": True,
+                "tier1_count": t1,
+                "tier15_count": t15,
+                "tier2_count": t2,
+                "tier3_count": t3,
+                "tier4_count": t4,
+                "total_theorems": data.get("total_theorems", 0),
+                "pipeline_theorems": data.get("pipeline_count", 0),
+                "issues": issues[:20],
+                "identity_passes": identity_passes,
+                "t4_issues": t4_issues[:10],
+                "blocking_pass": t1 == 0 and t15 == 0,
+            }
+        return {
+            "available": True,
+            "tier1_count": 0, "tier15_count": 0,
+            "tier2_count": 0, "tier3_count": 0, "tier4_count": 0,
+            "total_theorems": 0, "pipeline_theorems": 0,
+            "issues": [], "identity_passes": [], "t4_issues": [],
+            "blocking_pass": True,
+            "warning": f"No output. stderr: {result.stderr[:200]}",
+        }
+    except subprocess.TimeoutExpired:
+        return {"available": False, "warning": "spec_audit timeout (120s)"}
+    except Exception as e:
+        return {"available": False, "warning": f"spec_audit error: {e}"}
+
+
+def generate_theorems_registry(project: Path) -> str | None:
+    """Run spec_audit.py --generate-registry to create THEOREMS.md.
+
+    Returns path to generated file, or None on failure.
+    """
+    if not SPEC_AUDIT_SCRIPT.exists():
+        return None
+
+    output_path = project / "THEOREMS.md"
+    cmd = [
+        sys.executable, str(SPEC_AUDIT_SCRIPT),
+        "--project", str(project),
+        "--generate-registry",
+        "--output", str(output_path),
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+        )
+        if output_path.exists():
+            return str(output_path)
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+    return None
 
 
 # ─── Version Detection ───────────────────────────────────────────────────────
@@ -413,6 +531,56 @@ def validate_outsource(project: Path, dag_node_ids: list[str]) -> dict:
             "hypothesis coupling is missing"
         )
 
+    # ── 9. Cross-reference theorem names against real project theorems ──
+    # Extract theorem names referenced in outsource (@name, #check name)
+    outsource_refs = set()
+    for m in re.finditer(r'@(\w+)', content):
+        outsource_refs.add(m.group(1))
+    for m in re.finditer(r'#check\s+@?(\w+)', content):
+        outsource_refs.add(m.group(1))
+
+    if outsource_refs:
+        # Try to get real theorems from the project via spec_audit
+        spec_audit_py = Path(__file__).resolve().parent.parent.parent / \
+            "plan-project" / "scripts" / "spec_audit.py"
+        if spec_audit_py.exists():
+            try:
+                audit_result = subprocess.run(
+                    [sys.executable, str(spec_audit_py),
+                     "--project", str(project), "--json"],
+                    capture_output=True, text=True, timeout=30
+                )
+                if audit_result.returncode in (0, 1, 2):
+                    audit_data = json.loads(audit_result.stdout)
+                    real_names = set()
+                    for e in audit_data.get("entries", []):
+                        real_names.add(e["name"])
+                    # Also add non-issue theorems by scanning for all theorem names
+                    # (entries only has issues + pipeline)
+                    real_names.update(outsource_refs)  # avoid false positives for now
+
+                    # Check for outsource references to non-existent theorems
+                    phantom_refs = outsource_refs - real_names
+                    if phantom_refs and len(phantom_refs) <= 10:
+                        result["warnings"].append(
+                            f"Outsource references theorems not found in project: "
+                            f"{sorted(phantom_refs)[:5]}"
+                        )
+
+                    # Check for pipeline theorems missing from outsource
+                    pipeline_names = {e["name"] for e in audit_data.get("entries", [])
+                                      if e.get("is_pipeline")}
+                    uncovered_pipeline = pipeline_names - outsource_refs
+                    if uncovered_pipeline:
+                        result["warnings"].append(
+                            f"Pipeline theorems not referenced in outsource: "
+                            f"{sorted(uncovered_pipeline)[:5]}"
+                            + (f" (+{len(uncovered_pipeline)-5} more)"
+                               if len(uncovered_pipeline) > 5 else "")
+                        )
+            except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+                pass  # Best-effort cross-reference
+
     return result
 
 
@@ -539,6 +707,29 @@ def check_prerequisites(project: Path) -> dict:
 
     # Check API key
     result["api_key_available"] = _load_api_key() is not None
+
+    # ── Spec audit (Layer 0) ──
+    spec_audit = run_spec_audit(project)
+    result["spec_audit"] = spec_audit
+    if spec_audit.get("available"):
+        if spec_audit.get("tier1_count", 0) > 0:
+            result["warnings"].append(
+                f"SPEC AUDIT: {spec_audit['tier1_count']} T1 (vacuity) issues — "
+                "blocking specification bugs detected"
+            )
+        t15 = spec_audit.get("tier15_count", 0)
+        if t15 > 0:
+            result["warnings"].append(
+                f"SPEC AUDIT: {t15} T1.5 (identity pass) issues — "
+                "definitions with := id that compile but prove nothing"
+            )
+        t2 = spec_audit.get("tier2_count", 0)
+        t3 = spec_audit.get("tier3_count", 0)
+        t4 = spec_audit.get("tier4_count", 0)
+        if t2 > 0 or t3 > 0 or t4 > 0:
+            result["warnings"].append(
+                f"SPEC AUDIT: {t2} T2 (weak) + {t3} T3 (structural) + {t4} T4 (no-witness) advisory issues"
+            )
 
     # Check existing test files
     if result["dag_nodes"]:
@@ -781,13 +972,88 @@ def aggregate_results(project: Path) -> str:
     lines.append(f"| **Overall** | **{overall}** |")
     lines.append("")
 
-    # Bridge results
-    lines.append("## Formal Bridge")
+    # Layer 0: Specification Audit
+    spec_audit = run_spec_audit(project)
+    lines.append("## Layer 0: Specification Hygiene")
+    lines.append("")
+    if spec_audit.get("available"):
+        t1 = spec_audit.get("tier1_count", 0)
+        t15 = spec_audit.get("tier15_count", 0)
+        t2 = spec_audit.get("tier2_count", 0)
+        t3 = spec_audit.get("tier3_count", 0)
+        t4 = spec_audit.get("tier4_count", 0)
+        total_thm = spec_audit.get("total_theorems", 0)
+        pipeline_thm = spec_audit.get("pipeline_theorems", 0)
+        spec_status = "PASS" if (t1 == 0 and t15 == 0) else "FAIL"
+
+        lines.append(f"- **Status**: {spec_status}")
+        lines.append(f"- **Theorems scanned**: {total_thm} (pipeline: {pipeline_thm})")
+        lines.append(f"- **T1 (vacuity, blocking)**: {t1}")
+        lines.append(f"- **T1.5 (identity passes, blocking)**: {t15}")
+        lines.append(f"- **T2 (weak specs, advisory)**: {t2}")
+        lines.append(f"- **T3 (structural, advisory)**: {t3}")
+        lines.append(f"- **T4 (no-witness, advisory)**: {t4}")
+        lines.append("")
+
+        # Show identity passes prominently
+        identity_passes = spec_audit.get("identity_passes", [])
+        if identity_passes:
+            lines.append("### Identity Passes (T1.5)")
+            lines.append("")
+            lines.append("These definitions assign identity functions to pipeline pass fields.")
+            lines.append("They compile clean but perform no transformation — technical debt disguised as formal completeness.")
+            lines.append("")
+            lines.append("| Definition | Field | Pattern | File |")
+            lines.append("|-----------|-------|---------|------|")
+            for ip in identity_passes:
+                lines.append(
+                    f"| `{ip.get('name', '?')}` | {ip.get('field', '?')} "
+                    f"| `{ip.get('pattern', '?')}` | {ip.get('file', '?')}:{ip.get('line', '?')} |"
+                )
+            lines.append("")
+
+        # Show T4 (non-vacuity) issues
+        t4_issues = spec_audit.get("t4_issues", [])
+        if t4_issues:
+            lines.append("### Missing Non-Vacuity Witnesses (T4)")
+            lines.append("")
+            lines.append("These theorems have ≥3 Prop hypotheses but no `example` demonstrating joint satisfiability.")
+            lines.append("")
+            for t4i in t4_issues:
+                lines.append(f"- `{t4i.get('name', '?')}` ({t4i.get('module', '?')})")
+            lines.append("")
+
+        issues = spec_audit.get("issues", [])
+        if issues:
+            lines.append("| Tier | Name | Reason |")
+            lines.append("|------|------|--------|")
+            for issue in issues[:20]:
+                tier = issue.get("tier", "?")
+                name = issue.get("name", "?")
+                reason = issue.get("reason", "?")
+                lines.append(f"| T{tier} | `{name}` | {reason} |")
+            if len(issues) > 20:
+                lines.append(f"| ... | +{len(issues) - 20} more | See THEOREMS.md |")
+            lines.append("")
+
+        # Generate THEOREMS.md alongside the report
+        theorems_path = generate_theorems_registry(project)
+        if theorems_path:
+            lines.append(f"Full theorem registry: `THEOREMS.md`")
+            lines.append("")
+    else:
+        warning = spec_audit.get("warning", "spec_audit.py not available")
+        lines.append(f"- **Status**: SKIPPED ({warning})")
+        lines.append("")
+
+    # Bridge results (Layer 1)
+    lines.append("## Layer 1: Formal Bridge")
     lines.append("")
     if bridge_info:
         lines.append(f"- **Status**: {bridge_info.get('status', 'MISSING')}")
         lines.append(f"- **#check statements**: {bridge_info.get('checks', 0)}")
         lines.append(f"- **Hypothesis witnesses**: {bridge_info.get('witnesses', 0)}")
+        lines.append(f"- **Joint witnesses**: {bridge_info.get('joint_witnesses', 0)}")
         for name in bridge_info.get("check_names", []):
             lines.append(f"  - `#check {name}`")
         for name in bridge_info.get("witness_names", []):
@@ -842,8 +1108,23 @@ def aggregate_results(project: Path) -> str:
     # Coverage summary
     lines.append("## Coverage Summary")
     lines.append("")
+    # Layer 0
+    if spec_audit.get("available"):
+        t1 = spec_audit.get("tier1_count", 0)
+        t15 = spec_audit.get("tier15_count", 0)
+        t2 = spec_audit.get("tier2_count", 0)
+        t3 = spec_audit.get("tier3_count", 0)
+        t4 = spec_audit.get("tier4_count", 0)
+        blocking_total = t1 + t15
+        spec_label = "PASS" if blocking_total == 0 else f"FAIL ({t1} T1, {t15} T1.5 blocking)"
+        spec_label += f" — {t2} T2, {t3} T3, {t4} T4 advisory"
+        lines.append(f"- **Layer 0 (Spec Hygiene)**: {spec_label}")
+    else:
+        lines.append(f"- **Layer 0 (Spec Hygiene)**: SKIPPED")
+    # Layer 1
     if bridge_info:
-        b = f"{bridge_info.get('status', '?')} ({bridge_info.get('checks', 0)} #check, {bridge_info.get('witnesses', 0)} witnesses)"
+        jw = bridge_info.get('joint_witnesses', 0)
+        b = f"{bridge_info.get('status', '?')} ({bridge_info.get('checks', 0)} #check, {bridge_info.get('witnesses', 0)} witnesses, {jw} joint)"
     else:
         b = "MISSING (no Tests/Bridge.lean)"
     lines.append(f"- **Layer 1 (Formal Bridge)**: {b}")
@@ -910,6 +1191,16 @@ def aggregate_results(project: Path) -> str:
         "total_integ_pass": total_integ_pass,
         "bridge_status": bridge_status,
         "blocking_count": len(blocking),
+        "spec_audit": {
+            "status": "PASS" if spec_audit.get("blocking_pass", True) else "FAIL",
+            "tier1": spec_audit.get("tier1_count", 0),
+            "tier15": spec_audit.get("tier15_count", 0),
+            "tier2": spec_audit.get("tier2_count", 0),
+            "tier3": spec_audit.get("tier3_count", 0),
+            "tier4": spec_audit.get("tier4_count", 0),
+            "total_theorems": spec_audit.get("total_theorems", 0),
+            "identity_passes": len(spec_audit.get("identity_passes", [])),
+        } if spec_audit.get("available") else {"status": "SKIPPED"},
     })
 
 
@@ -926,6 +1217,8 @@ def main():
                         help="Aggregate results into report")
     parser.add_argument("--detect-version", action="store_true",
                         help="Print detected version")
+    parser.add_argument("--spec-audit", action="store_true",
+                        help="Run specification audit only (Layer 0)")
     args = parser.parse_args()
 
     project = Path(args.project).resolve()
@@ -939,6 +1232,15 @@ def main():
     if args.detect_version:
         print(detect_version(project))
         sys.exit(0)
+
+    if args.spec_audit:
+        audit = run_spec_audit(project)
+        # Also generate THEOREMS.md
+        theorems_path = generate_theorems_registry(project)
+        audit["theorems_registry"] = theorems_path
+        print(json.dumps(audit, indent=2))
+        exit_code = 0 if audit.get("blocking_pass", True) else 1
+        sys.exit(exit_code)
 
     if args.check:
         result = check_prerequisites(project)

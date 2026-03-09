@@ -18,9 +18,13 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from collections import defaultdict
+
+# ─── Spec Audit Integration ──────────────────────────────────────
+SPEC_AUDIT_SCRIPT = Path(__file__).parent.parent.parent / "plan-project" / "scripts" / "spec_audit.py"
 
 
 # ─── ARCHITECTURE.md Parser ──────────────────────────────────────
@@ -573,9 +577,86 @@ def scan_lean_files(project_dir):
     return result
 
 
+# ─── Hypothesis Coupling Analysis ─────────────────────────────
+
+def analyze_coupling(project_dir, scan):
+    """Analyze coupling between formal theorems (*Spec.lean) and tests.
+
+    Returns dict with coupling metrics: spec files, theorem count,
+    bridge status, #check coverage, coupled/uncoupled lists.
+    """
+    spec_files = []
+    spec_theorems = []
+
+    for fi in scan['files']:
+        path = fi['path']
+        if path.endswith('Spec.lean') and 'Tests/' not in path:
+            spec_files.append(path)
+            full_path = project_dir / path
+            try:
+                content = full_path.read_text(encoding='utf-8')
+            except (OSError, UnicodeDecodeError):
+                continue
+            for m in re.finditer(
+                r'^(theorem|lemma)\s+(\w+)', content, re.MULTILINE,
+            ):
+                spec_theorems.append({'name': m.group(2), 'file': path})
+
+    # Check for Tests/Bridge.lean
+    bridge_path = project_dir / 'Tests' / 'Bridge.lean'
+    bridge_exists = bridge_path.exists()
+    checked_names = set()
+
+    if bridge_exists:
+        try:
+            bridge_content = bridge_path.read_text(encoding='utf-8')
+            for m in re.finditer(r'#check\s+@?(\w+)', bridge_content):
+                checked_names.add(m.group(1))
+        except (OSError, UnicodeDecodeError):
+            pass
+
+    # Scan all Tests/ files for references to spec theorems
+    test_dir = project_dir / 'Tests'
+    test_references = set()
+    if test_dir.exists():
+        for lean_file in sorted(test_dir.rglob('*.lean')):
+            if '.lake' in str(lean_file):
+                continue
+            try:
+                content = lean_file.read_text(encoding='utf-8')
+            except (OSError, UnicodeDecodeError):
+                continue
+            for t in spec_theorems:
+                if t['name'] in content:
+                    test_references.add(t['name'])
+
+    # Classify
+    coupled = []
+    uncoupled = []
+    for t in spec_theorems:
+        if t['name'] in checked_names or t['name'] in test_references:
+            coupled.append(t)
+        else:
+            uncoupled.append(t)
+
+    total = len(spec_theorems)
+    ratio = round(len(coupled) / total * 100) if total > 0 else 0
+
+    return {
+        'spec_files': spec_files,
+        'spec_theorems_total': total,
+        'bridge_exists': bridge_exists,
+        'checked_count': len(checked_names),
+        'coupled': coupled,
+        'uncoupled': uncoupled,
+        'coupling_ratio': ratio,
+    }
+
+
 # ─── Text Report Generator ───────────────────────────────────────
 
-def generate_report(arch, readme, benchmarks, scan):
+def generate_report(arch, readme, benchmarks, scan, coupling=None,
+                    spec_audit=None, theorems_path=None):
     """Generate human-readable autopsy report."""
     out = []
 
@@ -627,6 +708,70 @@ def generate_report(arch, readme, benchmarks, scan):
             out.append('  (moderate — mixed spec + implementation)')
         else:
             out.append('  (high — spec-heavy codebase)')
+        out.append('')
+
+    # ── Specification Hygiene (from spec_audit.py)
+    if spec_audit and spec_audit.get("available"):
+        out.append('── SPECIFICATION HYGIENE ──')
+        t1 = spec_audit.get("tier1", 0)
+        t15 = spec_audit.get("tier15", 0)
+        t2 = spec_audit.get("tier2", 0)
+        t3 = spec_audit.get("tier3", 0)
+        t4 = spec_audit.get("tier4", 0)
+        total = spec_audit.get("total_theorems", 0)
+        blocking = t1 + t15
+
+        out.append(f'  Theorems scanned:              {total}')
+        out.append(f'  T1 (vacuity, blocking):        {t1}')
+        out.append(f'  T1.5 (identity passes):        {t15}')
+        out.append(f'  T2 (weak specs, advisory):     {t2}')
+        out.append(f'  T3 (structural, advisory):     {t3}')
+        out.append(f'  T4 (no-witness, advisory):     {t4}')
+
+        if blocking == 0:
+            out.append('  STATUS: PASS')
+        else:
+            parts = []
+            if t1 > 0:
+                parts.append(f'{t1} T1')
+            if t15 > 0:
+                parts.append(f'{t15} T1.5')
+            out.append(f'  STATUS: FAIL ({" + ".join(parts)} blocking)')
+
+        # Show identity passes
+        identity_passes = spec_audit.get("identity_passes", [])
+        if identity_passes:
+            out.append('')
+            out.append('  IDENTITY PASSES:')
+            for ip in identity_passes[:15]:
+                name = ip.get("name", "?")
+                field = ip.get("field", "?")
+                pattern = ip.get("pattern", "?")
+                file = ip.get("file", "?")
+                line = ip.get("line", "?")
+                out.append(f'    {name}.{field} {pattern} ({file}:{line})')
+            if len(identity_passes) > 15:
+                out.append(f'    ... +{len(identity_passes) - 15} more (see THEOREMS.md)')
+
+        # Show T4 issues
+        t4_entries = [e for e in spec_audit.get("entries", [])
+                      if any("T4" in w for w in e.get("warnings", []))]
+        if t4_entries:
+            out.append('')
+            out.append('  MISSING NON-VACUITY WITNESSES:')
+            for entry in t4_entries[:10]:
+                out.append(f'    {entry.get("name", "?")} ({entry.get("module", "?")})')
+            if len(t4_entries) > 10:
+                out.append(f'    ... +{len(t4_entries) - 10} more')
+
+        if theorems_path:
+            out.append('')
+            out.append(f'  THEOREMS.md: {theorems_path}')
+
+        out.append('')
+    elif spec_audit:
+        out.append('── SPECIFICATION HYGIENE ──')
+        out.append(f'  SKIPPED ({spec_audit.get("warning", "unavailable")})')
         out.append('')
 
     # ── Documentation status
@@ -772,6 +917,23 @@ def generate_report(arch, readme, benchmarks, scan):
                 out.append(f'    ... +{len(names) - 8} more')
         out.append('')
 
+    # ── Hypothesis coupling
+    if coupling and coupling['spec_theorems_total'] > 0:
+        out.append('── HYPOTHESIS COUPLING ──')
+        out.append(f'  Spec files:         {len(coupling["spec_files"])}')
+        out.append(f'  Formal theorems:    {coupling["spec_theorems_total"]}')
+        bridge_str = 'FOUND' if coupling['bridge_exists'] else 'NOT FOUND'
+        out.append(f'  Tests/Bridge.lean:  {bridge_str}')
+        out.append(f'  #check coverage:    {coupling["checked_count"]}/{coupling["spec_theorems_total"]}')
+        out.append(f'  Coupling ratio:     {coupling["coupling_ratio"]}%')
+        if coupling['uncoupled']:
+            out.append('  UNCOUPLED THEOREMS:')
+            for t in coupling['uncoupled'][:15]:
+                out.append(f'    - {t["name"]} ({t["file"]})')
+            if len(coupling['uncoupled']) > 15:
+                out.append(f'    ... +{len(coupling["uncoupled"]) - 15} more')
+        out.append('')
+
     # ── File breakdown
     out.append('── FILE BREAKDOWN (top 15 by LOC) ──')
     sorted_files = sorted(scan['files'], key=lambda f: f['loc'], reverse=True)
@@ -823,6 +985,56 @@ def generate_report(arch, readme, benchmarks, scan):
     return '\n'.join(out)
 
 
+# ─── Spec Audit Runner ────────────────────────────────────────────
+
+def run_spec_audit(project_dir):
+    """Run spec_audit.py and return structured results."""
+    if not SPEC_AUDIT_SCRIPT.exists():
+        return {"available": False, "warning": "spec_audit.py not found"}
+
+    cmd = [sys.executable, str(SPEC_AUDIT_SCRIPT), "--project", str(project_dir), "--json"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        output = result.stdout.strip()
+        if output:
+            data = json.loads(output)
+            return {
+                "available": True,
+                "tier1": data.get("tier1_issues", 0),
+                "tier15": data.get("tier15_issues", 0),
+                "tier2": data.get("tier2_issues", 0),
+                "tier3": data.get("tier3_issues", 0),
+                "tier4": data.get("tier4_issues", 0),
+                "total_theorems": data.get("total_theorems", 0),
+                "identity_passes": data.get("identity_passes", []),
+                "entries": data.get("entries", []),
+            }
+        return {"available": False, "warning": f"No output. stderr: {result.stderr[:200]}"}
+    except subprocess.TimeoutExpired:
+        return {"available": False, "warning": "spec_audit timeout (120s)"}
+    except Exception as e:
+        return {"available": False, "warning": f"spec_audit error: {e}"}
+
+
+def generate_theorems_md(project_dir):
+    """Run spec_audit.py --generate-registry to create THEOREMS.md."""
+    if not SPEC_AUDIT_SCRIPT.exists():
+        return None
+    cmd = [
+        sys.executable, str(SPEC_AUDIT_SCRIPT),
+        "--project", str(project_dir),
+        "--generate-registry", "--output", "THEOREMS.md",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        theorems_path = project_dir / "THEOREMS.md"
+        if theorems_path.exists():
+            return str(theorems_path)
+    except Exception:
+        pass
+    return None
+
+
 # ─── Main ────────────────────────────────────────────────────────
 
 def main():
@@ -845,6 +1057,9 @@ def main():
     readme = parse_readme(project_dir / 'README.md')
     benchmarks = parse_benchmarks(project_dir / 'BENCHMARKS.md')
     scan = scan_lean_files(project_dir)
+    coupling = analyze_coupling(project_dir, scan)
+    spec_audit = run_spec_audit(project_dir)
+    theorems_path = generate_theorems_md(project_dir) if spec_audit.get("available") else None
 
     # Prefer dag.json over ARCHITECTURE.md regex for nodes/blocks
     if dag['found']:
@@ -864,10 +1079,14 @@ def main():
             'readme': readme,
             'benchmarks': benchmarks,
             'scan': scan,
+            'coupling': coupling,
+            'spec_audit': spec_audit,
+            'theorems_md': theorems_path,
         }
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
-        print(generate_report(arch, readme, benchmarks, scan))
+        print(generate_report(arch, readme, benchmarks, scan, coupling,
+                              spec_audit, theorems_path))
 
 
 if __name__ == '__main__':

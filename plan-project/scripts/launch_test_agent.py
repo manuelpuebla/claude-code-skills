@@ -44,9 +44,21 @@ If the Test Specifications below contain a "Formal Bridge Requirements" section,
 2. Import the project library
 3. Define the concrete test domain type (e.g., ArithOp) OR import it from Tests/Integration/
 4. Add #check statements for ALL formal theorems listed in Bridge Requirements
-5. Add hypothesis witness proofs where feasible (theorem bridge_xxx : HypType := ...)
-6. Compile: lake env lean Tests/Bridge.lean (from {project_path})
+5. **Joint Witnesses** (CRITICAL): For EACH pipeline theorem with >=2 Prop hypotheses,
+   construct ONE `example` that applies the theorem with ALL hypotheses discharged
+   simultaneously on concrete values. Pattern:
+   ```lean
+   example : <conclusion_type> := theorem_name concrete_arg1 (proof_of_h1) (proof_of_h2) ...
+   ```
+   This proves the hypotheses are jointly satisfiable, not just individually.
+6. Individual witnesses (theorem bridge_xxx) are still useful for complex single hypotheses.
+7. Compile: lake env lean Tests/Bridge.lean (from {project_path})
 Bridge.lean MUST compile cleanly before writing other test files.
+
+## Canonical Examples (for pipeline theorems)
+For each pipeline theorem referenced in Bridge Requirements, write at least one `#eval`
+in Tests/Integration/ that demonstrates the theorem's conclusion with concrete values.
+This serves as a human-readable sanity check that the theorem says what we think it says.
 
 ## Test Conventions
 {mathlib_property_instructions}
@@ -69,7 +81,7 @@ For each node:
 Return exactly:
 ---TEST-RESULTS---
 OVERALL: PASS | FAIL
-BRIDGE: PASS|FAIL|SKIPPED - {{N}} #check statements, {{M}} witnesses
+BRIDGE: PASS|FAIL|SKIPPED - {{N}} #check statements, {{M}} witnesses, {{J}} joint witnesses
 RESULTS_FILE: {results_path}
 {node_result_placeholders}
 [BLOCKING: test_name: reason (if any failures)]

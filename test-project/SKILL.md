@@ -1,20 +1,26 @@
 ---
 name: test-project
-description: "Testing end-to-end de proyecto Lean 4: genera specs, escribe tests, ejecuta y produce reporte de 3 capas."
+description: "Testing end-to-end de proyecto Lean 4: spec audit + genera specs, escribe tests, ejecuta y produce reporte de 4 capas."
 allowed-tools: [Task, Bash(python3 *), Read, Glob, Grep, Write]
-argument-hint: "<project-dir> [--nodes N1.1,N2.1] [--force-generate] [--force-rewrite]"
+argument-hint: "<project-dir> [--nodes N1.1,N2.1] [--force-generate] [--force-rewrite] [--spec-only]"
 ---
 
 # Test Project: End-to-End Testing for Lean 4 Projects
 
 Orchestrates full project testing using existing scripts. Reuses all existing material (TESTS_OUTSOURCE.md, test .lean files) unless explicitly told to regenerate.
 
+**4 Layers of Verification:**
+- **Layer 0**: Specification Hygiene — theorem statements are non-vacuous, well-formed, properly directed
+- **Layer 1**: Formal Bridge — theorems compile, hypotheses have witnesses
+- **Layer 2**: Properties — invariants, soundness, equivalences (SlimCheck / #eval)
+- **Layer 3**: Integration — concrete behaviors, edge cases, stress tests
+
 ## Help Request Detection
 
 If the user invokes with `?`, `--help`, `help`, show this quick reference instead of running:
 
 ```
-/test-project - End-to-end testing for Lean 4 projects
+/test-project - End-to-end testing for Lean 4 projects (4 layers)
 
 USAGE:
   /test-project <project-dir> [options]
@@ -23,22 +29,63 @@ OPTIONS:
   --nodes N1.1,N2.1   Test only specific nodes (default: all)
   --force-generate     Regenerate TESTS_OUTSOURCE.md even if it exists
   --force-rewrite      Rewrite test .lean files even if they exist
+  --spec-only          Run only Layer 0 (spec audit) + generate THEOREMS.md
 
 EXAMPLES:
   /test-project ~/Documents/claudio/Trust-Lean
   /test-project ~/Documents/claudio/optisat --nodes N1.1,N1.2
   /test-project . --force-generate
+  /test-project ~/Documents/claudio/amo-lean --spec-only
 
 OUTPUT:
   report_{project}_{version}.md in project root
   Tests/results.json (machine-readable)
+  THEOREMS.md (theorem registry for human audit)
+
+LAYERS:
+  0: Spec Hygiene   — vacuity, identity passes, weak specs, structural, non-vacuity, T5 (--deep)
+  1: Formal Bridge   — #check + hypothesis witnesses + joint witnesses + canonical examples
+  2: Properties      — SlimCheck / #eval invariants
+  3: Integration     — concrete behavior tests
 
 PREREQUISITES:
   - dag.json with "phases" key (from /plan-project or /tidy-project)
+    NOTE: dag.json is NOT required for --spec-only mode
   - GOOGLE_API_KEY in env (only if TESTS_OUTSOURCE.md needs to be generated)
 ```
 
 ## Workflow
+
+### --spec-only shortcut
+
+If the user passes `--spec-only`, run ONLY the spec audit (Layer 0) without requiring dag.json or any other prerequisites:
+
+```bash
+python3 ~/.claude/skills/test-project/scripts/test_project.py \
+  --spec-audit --project {PROJECT_DIR}
+```
+
+Read the JSON output and present:
+```
+/test-project --spec-only: {Project Name}
+
+SPEC AUDIT (Layer 0):
+  Theorems scanned: {total}
+  T1 (vacuity, blocking): {count}
+  T1.5 (identity passes, blocking): {count}
+  T2 (weak specs, advisory): {count}
+  T3 (structural, advisory): {count}
+  T4 (no-witness, advisory): {count}
+  STATUS: {PASS|FAIL}
+
+{If T1 > 0: list T1 issues}
+{If T1.5 > 0: list identity passes — these are specs that compile clean but prove nothing}
+{If T2+T3 > 0: list top 5 issues}
+
+THEOREMS.md: {path} (generated for human review)
+```
+
+Then STOP — do not continue to Paso 0/1/2/3/4/5/6.
 
 ### Paso 0: Validate prerequisites
 
@@ -66,6 +113,20 @@ If exit code 3, inform the user:
 - "dag.json not found" → suggest running `/plan-project` or `/tidy-project` first
 - "dag.json has neither phases nor declarations" → suggest `/tidy-project`
 - "No outsource + no API key" → suggest setting `GOOGLE_API_KEY` or creating TESTS_OUTSOURCE.md manually
+
+### Paso 0.5: Specification Audit (Layer 0)
+
+The Paso 0 JSON output includes a `spec_audit` key with the results. Read it and note:
+
+- **T1 issues (vacuity)**: Report prominently — these indicate theorems that prove nothing (e.g., `theorem X : True`)
+- **T1.5 issues (identity passes)**: Report prominently — definitions with `:= id` or `fun x => x` in pipeline pass fields. These compile clean but perform no transformation, hiding technical debt as formal completeness.
+- **T2 issues (weak specs)**: Report as advisory — existential-only conclusions, pipeline sorry, unused params
+- **T3 issues (structural)**: Report as advisory — name/conclusion mismatch, >8 hypotheses
+- **T4 issues (no-witness)**: Report as advisory — theorems with ≥3 Prop hypotheses lacking non-vacuity witnesses
+
+T1 and T1.5 issues do NOT block test execution (unlike in close_block.py) but they are highlighted in the final report.
+
+If `spec_audit.available` is `false`, note the warning and continue — the audit is best-effort.
 
 ### Paso 1: Generate TESTS_OUTSOURCE.md (ONLY if missing or --force-generate)
 
@@ -148,15 +209,19 @@ Read the generated report file and present a concise summary to the user:
 ```
 /test-project: {Project Name} v{version}
 
+SPEC HYGIENE: {PASS|FAIL|SKIPPED} (T1:{n} T1.5:{n} T2:{n} T3:{n} T4:{n} — {total} theorems)
 BRIDGE:       {PASS|FAIL|MISSING} ({N} #check, {M} witnesses)
 PROPERTIES:   {pass}/{total} PASS ({nr} not runnable)
 INTEGRATION:  {pass}/{total} PASS
 OVERALL:      {ALL PASS | N FAILURES}
 
+{If T1 > 0: list T1 issues (these are spec bugs, not test failures)}
+{If T1.5 > 0: list identity passes (specs that compile but prove nothing)}
 {If failures: list blocking failures}
 
 Report: {path_to_report}
 Results: Tests/results.json
+THEOREMS.md: {path} (theorem registry)
 ```
 
 ## Notes

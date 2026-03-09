@@ -30,11 +30,13 @@ EXAMPLES:
 
 OUTPUT:
   1. Project overview (LOC, theorems, sorry, axioms)
-  2. README claims cross-referenced with code evidence
-  3. DAG structure + completion status
-  4. Coverage gaps (defs without theorems)
-  5. SlimCheck property suggestions (if --suggest-properties)
-  6. Risk assessment per node
+  2. Specification hygiene (T1 vacuity, T1.5 identity passes, T2-T4)
+  3. README claims cross-referenced with code evidence
+  4. DAG structure + completion status
+  5. Coverage gaps (defs without theorems)
+  6. SlimCheck property suggestions (if --suggest-properties)
+  7. Risk assessment per node
+  8. THEOREMS.md registry (generated)
 ```
 
 ## Workflow
@@ -54,6 +56,28 @@ This produces a structured report with:
 - BENCHMARKS.md presence
 - Component breakdown
 - Version history
+
+### Paso 1.5: Specification Hygiene
+
+The autopsy script automatically runs `spec_audit.py` and produces a `── SPECIFICATION HYGIENE ──` section with:
+
+- **T1 (vacuity, blocking)**: Theorems that prove nothing (`True`, `⊤`, tautology `a=a`)
+- **T1.5 (identity passes, blocking)**: Definitions with `:= id` or `fun x => x` in pass fields, and trivial proofs (`by trivial`, `by exact True.intro`) in proof fields. These compile clean but have zero probative value.
+- **T2 (weak specs, advisory)**: Existential-only conclusions, pipeline sorry, unused params
+- **T3 (structural, advisory)**: Name/conclusion mismatch, >8 hypotheses
+- **T4 (no-witness, advisory)**: Theorems with Prop hypotheses lacking non-vacuity witnesses. Pipeline threshold=2, default=3.
+- **T5 (weak conclusion, --deep only)**: Pipeline theorems with trivially-weak conclusions (strength<=1)
+
+If T1 or T1.5 > 0, STATUS = FAIL. The section lists all identity passes with file:line and all T4 entries.
+
+With `--deep` mode (when available), the audit also checks:
+- Semantic identity passes via Lean `rfl` (catches obfuscated identity functions)
+- Dead hypotheses (Prop hypotheses not used in proof body)
+- Conclusion strength scoring (T5)
+
+The script also generates `THEOREMS.md` — a full registry of all theorems for human audit.
+
+This data comes automatically from the script; no additional flags needed.
 
 ### Paso 2: Semantic claim analysis
 
@@ -87,6 +111,18 @@ CLAIM CROSS-REFERENCE:
   [PARTIAL]   "preserves CCS satisfaction"    -> theorem exists but has sorry
   [GAP]       "supports Plonky2/3"            -> cost model exists, no soundness theorem
 ```
+
+### Paso 3.5: Hypothesis coupling analysis
+
+The autopsy script automatically analyzes coupling between formal theorems (`*Spec.lean` files) and tests. The report includes:
+
+- Count of `*Spec.lean` files and formal theorems found
+- Whether `Tests/Bridge.lean` exists
+- How many theorems have `#check` coverage in Bridge.lean
+- Coupling ratio: % of spec theorems referenced in any test file
+- List of uncoupled theorems (formal proofs with no test connection)
+
+This section appears automatically in the report as `── HYPOTHESIS COUPLING ──` when `*Spec.lean` files exist. No flags needed.
 
 ### Paso 4: Suggest SlimCheck properties (if --suggest-properties)
 
@@ -141,6 +177,14 @@ Output the complete autopsy in this format:
 -- VERIFICATION STATUS --
   ZERO SORRY / N sorry pending
 
+-- SPECIFICATION HYGIENE --
+  Theorems scanned: {N}
+  T1 (vacuity): {n}  T1.5 (identity passes): {n}
+  T2 (weak): {n}  T3 (structural): {n}  T4 (no-witness): {n}
+  STATUS: {PASS|FAIL}
+  [identity passes list, T4 entries if any]
+  THEOREMS.md: {path}
+
 -- CLAIM CROSS-REFERENCE --
   [from Paso 3]
 
@@ -149,6 +193,9 @@ Output the complete autopsy in this format:
 
 -- COVERAGE GAPS --
   [uncovered defs, missing theorems]
+
+-- HYPOTHESIS COUPLING --
+  [spec files, theorems, Bridge.lean status, coupling ratio, uncoupled list]
 
 -- RISK ASSESSMENT --
   [per node/component risk level]
@@ -188,7 +235,7 @@ README.md              ARCHITECTURE.md           *.lean files
 
 ## Notes
 
-- This skill is **read-only** -- it never modifies project files
+- This skill is **read-only** -- it never modifies project files (except generating THEOREMS.md)
 - For projects without ARCHITECTURE.md, it falls back to source-only analysis
 - For projects without README.md, it skips claim analysis and focuses on code inventory
 - The `--json` flag passes through to the script for programmatic consumption
